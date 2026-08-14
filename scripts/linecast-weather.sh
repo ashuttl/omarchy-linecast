@@ -1,0 +1,18 @@
+#!/bin/bash
+# Omarchy bar module: linecast weather
+# Bar shows "<icon> <temp>", tooltip shows the full oneline summary.
+
+line=$(linecast weather --oneline --print 2>/dev/null)
+
+if [[ -z "$line" ]]; then
+  # Collapse the module when weather is unavailable (matches omarchy default behavior)
+  echo '{"text": "", "class": "unavailable"}'
+  exit 0
+fi
+
+# Oneline format: "<City> <temp>°F <icon> <Condition> Wind <n>mph 💧<n>%"
+temp=$(grep -oE -- '-?[0-9]+°[FC]' <<<"$line" | head -1)
+icon=$(sed -E 's/.*-?[0-9]+°[FC] ([^ ]+) .*/\1/' <<<"$line")
+
+jq -cn --arg text "$icon ${temp%[FC]}" --arg tooltip "$line" \
+  '{text: $text, tooltip: $tooltip}'

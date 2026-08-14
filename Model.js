@@ -1,0 +1,96 @@
+// Data layer for the linecast weather panel. The payload comes from
+// `linecast weather --json` (schema 1); everything here is defensive
+// because the panel renders whatever an older or partial payload gives it.
+.pragma library
+
+function parsePayload(raw) {
+  var trimmed = String(raw || "").trim()
+  if (trimmed === "") return null
+  try {
+    var data = JSON.parse(trimmed)
+    return data && data.schema === 1 ? data : null
+  } catch (e) {
+    return null
+  }
+}
+
+function roundTemp(value) {
+  return (value === null || value === undefined || isNaN(value)) ? "–" : String(Math.round(value)) + "°"
+}
+
+function num(value, fallback) {
+  return (value === null || value === undefined || isNaN(value)) ? fallback : Number(value)
+}
+
+// "2026-08-14T14:00" -> "2p" (linecast's own compact hour style).
+function hourLabel(isoTime) {
+  var m = /T(\d{2}):/.exec(String(isoTime || ""))
+  if (!m) return ""
+  var h = parseInt(m[1], 10)
+  var suffix = h < 12 ? "a" : "p"
+  var display = h % 12
+  if (display === 0) display = 12
+  return display + suffix
+}
+
+// "2026-08-14T05:41" -> "5:41a"
+function clockLabel(isoTime) {
+  var m = /T(\d{2}):(\d{2})/.exec(String(isoTime || ""))
+  if (!m) return ""
+  var h = parseInt(m[1], 10)
+  var suffix = h < 12 ? "a" : "p"
+  var display = h % 12
+  if (display === 0) display = 12
+  return display + ":" + m[2] + suffix
+}
+
+// Sample every `step`-th hour so 24 hourly entries become a readable strip.
+function sampleHours(hourly, step, maxColumns) {
+  var out = []
+  if (!hourly || !hourly.length) return out
+  for (var i = 0; i < hourly.length && out.length < maxColumns; i += step)
+    out.push(hourly[i])
+  return out
+}
+
+function tempExtent(entries, lowKey, highKey) {
+  var min = NaN, max = NaN
+  for (var i = 0; i < (entries ? entries.length : 0); i++) {
+    var lo = num(entries[i][lowKey], NaN)
+    var hi = num(entries[i][highKey === undefined ? lowKey : highKey], NaN)
+    if (!isNaN(lo) && (isNaN(min) || lo < min)) min = lo
+    if (!isNaN(hi) && (isNaN(max) || hi > max)) max = hi
+  }
+  if (isNaN(min) || isNaN(max)) return { min: 0, max: 1, span: 1 }
+  var span = max - min
+  return { min: min, max: max, span: span > 0 ? span : 1 }
+}
+
+// 0..1 position of a value within an extent, clamped.
+function extentPos(value, extent) {
+  var v = num(value, extent.min)
+  return Math.min(1, Math.max(0, (v - extent.min) / extent.span))
+}
+
+// "2026-08-14" + index -> "Today" / short weekday.
+function dayLabel(dateStr, index, locale) {
+  if (index === 0) return "Today"
+  var parts = String(dateStr || "").split("-")
+  if (parts.length !== 3) return ""
+  var d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]))
+  return locale.dayName(d.getDay(), 1 /* Locale.ShortFormat */)
+}
+
+function severityIsUrgent(severity) {
+  var s = String(severity || "").toLowerCase()
+  return s === "severe" || s === "extreme" || s === "warning"
+}
+
+function windLine(current, units) {
+  var speed = num(current ? current.wind_speed : NaN, NaN)
+  if (isNaN(speed)) return ""
+  var line = Math.round(speed) + " " + String(units && units.wind || "")
+  var gusts = num(current ? current.wind_gusts : NaN, NaN)
+  if (!isNaN(gusts) && gusts >= speed + 5) line += " (" + Math.round(gusts) + ")"
+  return line
+}

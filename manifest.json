@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "ashuttl.linecast",
+  "name": "Linecast",
+  "version": "0.1.0",
+  "author": "Andrew Shuttleworth",
+  "license": "MIT",
+  "description": "Weather, sun, moon, and tide pills from linecast, with an anchored weather panel",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Linecast",
+    "description": "Weather pill with hover-reveal sun/moon/tide pills and a weather popup",
+    "category": "Weather",
+    "allowMultiple": false
+  }
+}
