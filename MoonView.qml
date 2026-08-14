@@ -3,15 +3,17 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Moon face: a drawn phase disc — correct terminator, waxing lights the
-// proper limb, mirrored for the southern hemisphere — beside the phase
-// name and illumination, with rise/set (the part Andrew actually checks)
-// and the next full/new dates. Fed by `linecast moon --json`.
+// Moon face, in the stock panel style: the drawn phase disc is the header
+// icon (correct terminator, waxing lights the proper limb, mirrored for
+// the southern hemisphere), phase and "up now" as the status line,
+// illumination as the reading. Rise/set below — the part actually worth
+// glancing for — then the cycle numbers. Fed by `linecast moon --json`.
 Item {
   id: view
 
   property var bar
   property bool shown: false
+  property int locationEpoch: 0
 
   readonly property int panelWidth: Style.space(320)
 
@@ -25,6 +27,11 @@ Item {
   function refresh() { feed.refresh() }
 
   onShownChanged: if (shown) feed.refreshIfStale()
+  onLocationEpochChanged: {
+    feed.payload = null
+    feed.fetchedAtMs = 0
+    if (shown) feed.refresh()
+  }
 
   implicitHeight: column.implicitHeight
 
@@ -32,7 +39,64 @@ Item {
     id: feed
     command: "linecast moon --json"
     staleAfterMs: 30 * 60 * 1000
-    onPayloadChanged: disc.requestPaint()
+  }
+
+  component MoonDisc: Canvas {
+    id: disc
+
+    property real discSize: Style.space(40)
+
+    width: discSize
+    height: discSize
+
+    Connections {
+      target: feed
+      function onPayloadChanged() { disc.requestPaint() }
+    }
+
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.clearRect(0, 0, width, height)
+      if (!view.payload) return
+
+      var cx = width / 2
+      var cy = height / 2
+      var R = Math.min(cx, cy) - 1
+      var f = Math.max(0, Math.min(1, Model.num(view.payload.illumination, 0) / 100))
+      var litRight = view.payload.waxing === true
+      if (view.payload.southern === true) litRight = !litRight
+
+      // Shadow disc first; the lit region paints over it.
+      ctx.beginPath()
+      ctx.arc(cx, cy, R, 0, 2 * Math.PI)
+      ctx.fillStyle = Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.14)
+      ctx.fill()
+
+      if (f > 0.005) {
+        // Lit region = outer semicircle on the lit limb plus the
+        // terminator, a half-ellipse whose width tracks the phase: full at
+        // the limbs, a straight line at the quarters. Past half it bulges
+        // into the dark side (gibbous), before half into the lit side
+        // (crescent). Drawn parametrically — Qt's Canvas ellipse() is a
+        // nonstandard full-ellipse helper that would break the path.
+        var rx = R * Math.abs(2 * f - 1)
+        var side = ((f >= 0.5) ? !litRight : litRight) ? 1 : -1
+
+        ctx.beginPath()
+        // Outer semicircle, top to bottom along the lit limb. Canvas
+        // angles run clockwise (y down): -π/2 → π/2 clockwise passes the
+        // right limb; counterclockwise passes the left.
+        ctx.arc(cx, cy, R, -Math.PI / 2, Math.PI / 2, !litRight)
+        var steps = 40
+        for (var i = 1; i <= steps; i++) {
+          var th = Math.PI / 2 - Math.PI * i / steps
+          ctx.lineTo(cx + side * rx * Math.cos(th), cy + R * Math.sin(th))
+        }
+        ctx.closePath()
+        ctx.fillStyle = view.foreground
+        ctx.fill()
+      }
+    }
   }
 
   Column {
@@ -53,117 +117,29 @@ Item {
       font.pixelSize: Style.font.body
     }
 
-    // ---- Hero: the disc, with phase and illumination beside it.
-    Row {
+    FaceHeader {
       visible: !!view.payload
-      anchors.horizontalCenter: parent.horizontalCenter
-      spacing: Style.space(20)
-
-      Canvas {
-        id: disc
-        width: Style.space(88)
-        height: Style.space(88)
-        anchors.verticalCenter: parent.verticalCenter
-
-        onPaint: {
-          var ctx = getContext("2d")
-          ctx.clearRect(0, 0, width, height)
-          if (!view.payload) return
-
-          var cx = width / 2
-          var cy = height / 2
-          var R = Math.min(cx, cy) - 2
-          var f = Math.max(0, Math.min(1, Model.num(view.payload.illumination, 0) / 100))
-          var litRight = view.payload.waxing === true
-          if (view.payload.southern === true) litRight = !litRight
-
-          var lit = Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 1)
-          var shadow = Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.14)
-
-          // Shadow disc first; the lit region paints over it.
-          ctx.beginPath()
-          ctx.arc(cx, cy, R, 0, 2 * Math.PI)
-          ctx.fillStyle = shadow
-          ctx.fill()
-
-          if (f > 0.005) {
-            // Lit region = outer semicircle on the lit limb plus the
-            // terminator, a half-ellipse whose width tracks the phase:
-            // full at the limbs, a straight line at the quarters. Past
-            // half it bulges into the dark side (gibbous), before half
-            // into the lit side (crescent). The half-ellipse is drawn
-            // parametrically — Qt's Canvas ellipse() is a nonstandard
-            // full-ellipse helper that would break the path.
-            var rx = R * Math.abs(2 * f - 1)
-            var side = ((f >= 0.5) ? !litRight : litRight) ? 1 : -1
-
-            ctx.beginPath()
-            // Outer semicircle, top to bottom along the lit limb. Canvas
-            // angles run clockwise (y down): -π/2 → π/2 clockwise passes
-            // the right limb; counterclockwise passes the left.
-            ctx.arc(cx, cy, R, -Math.PI / 2, Math.PI / 2, !litRight)
-            // Terminator, bottom back to top.
-            var steps = 40
-            for (var i = 1; i <= steps; i++) {
-              var th = Math.PI / 2 - Math.PI * i / steps
-              ctx.lineTo(cx + side * rx * Math.cos(th), cy + R * Math.sin(th))
-            }
-            ctx.closePath()
-            ctx.fillStyle = lit
-            ctx.fill()
-          }
+      iconComponent: Component { MoonDisc {} }
+      title: "Moon"
+      subtitle: {
+        if (!view.payload) return ""
+        var line = view.payload.phase || ""
+        if (view.payload.up_now === true) {
+          line += " · up now"
+          var alt = Model.num(view.payload.altitude_deg, NaN)
+          if (!isNaN(alt)) line += " " + Math.round(alt) + "°"
         }
+        return line
       }
-
-      Column {
-        anchors.verticalCenter: parent.verticalCenter
-        spacing: Style.space(2)
-
-        Text {
-          text: view.payload ? (view.payload.phase || "") : ""
-          color: view.foreground
-          font.family: view.fontFamily
-          font.pixelSize: Style.font.body
-          font.bold: true
-        }
-
-        Text {
-          text: view.payload && Model.num(view.payload.illumination, -1) >= 0
-            ? Math.round(view.payload.illumination) + "% illuminated" : ""
-          color: view.muted
-          font.family: view.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-
-        Text {
-          visible: !!(view.payload && view.payload.up_now === true)
-          topPadding: Style.space(4)
-          text: {
-            var line = "up right now"
-            var alt = view.payload ? Model.num(view.payload.altitude_deg, NaN) : NaN
-            if (!isNaN(alt)) line += " · " + Math.round(alt) + "° up"
-            return line
-          }
-          color: view.foreground
-          font.family: view.fontFamily
-          font.pixelSize: Style.font.caption
-          font.italic: true
-        }
-
-        Text {
-          topPadding: Style.space(6)
-          text: view.payload ? (view.payload.location || "") : ""
-          color: view.muted
-          font.family: view.fontFamily
-          font.pixelSize: Style.font.caption
-        }
-      }
+      bigValue: view.payload && Model.num(view.payload.illumination, -1) >= 0
+        ? Math.round(view.payload.illumination) + "%" : ""
+      foreground: view.foreground
+      fontFamily: view.fontFamily
     }
 
     PanelSeparator { visible: view.events.length > 0; foreground: view.foreground }
 
-    // ---- Rise and set: the next events in order, the thing worth
-    //      glancing for ("it's up right now").
+    // ---- Rise and set: the next events in order.
     Row {
       visible: view.events.length > 0
       anchors.horizontalCenter: parent.horizontalCenter
@@ -197,38 +173,50 @@ Item {
 
     PanelSeparator { visible: !!view.payload; foreground: view.foreground }
 
-    // ---- Footer: where the cycle goes next.
+    // ---- Info grid: where the cycle goes next.
     Row {
       visible: !!view.payload
-      anchors.horizontalCenter: parent.horizontalCenter
-      spacing: Style.space(20)
-      bottomPadding: Style.space(4)
+      width: parent.width
+      spacing: Style.space(16)
 
-      GlanceStat {
-        glyph: "󰽢"
-        value: view.payload && view.payload.next_full
-          ? "full " + Model.shortDate(view.payload.next_full) : ""
-        glyphColor: view.muted
-        valueColor: view.foreground
-        fontFamily: view.fontFamily
+      Column {
+        width: (parent.width - parent.spacing) / 2
+        spacing: Style.space(4)
+
+        InfoPair {
+          label: "Next full"
+          value: view.payload && view.payload.next_full ? Model.shortDate(view.payload.next_full) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+
+        InfoPair {
+          label: "Next new"
+          value: view.payload && view.payload.next_new ? Model.shortDate(view.payload.next_new) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
       }
 
-      GlanceStat {
-        glyph: "󰽤"
-        value: view.payload && view.payload.next_new
-          ? "new " + Model.shortDate(view.payload.next_new) : ""
-        glyphColor: view.muted
-        valueColor: view.foreground
-        fontFamily: view.fontFamily
-      }
+      Column {
+        width: (parent.width - parent.spacing) / 2
+        spacing: Style.space(4)
 
-      GlanceStat {
-        glyph: "󰥔"
-        value: view.payload && Model.num(view.payload.age_days, -1) >= 0
-          ? Math.round(view.payload.age_days) + "d old" : ""
-        glyphColor: view.muted
-        valueColor: view.foreground
-        fontFamily: view.fontFamily
+        InfoPair {
+          label: "Age"
+          value: view.payload && Model.num(view.payload.age_days, -1) >= 0
+            ? Math.round(view.payload.age_days) + " days" : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+
+        InfoPair {
+          label: "Altitude"
+          value: view.payload && Model.num(view.payload.altitude_deg, NaN) === Model.num(view.payload.altitude_deg, NaN)
+            ? Math.round(view.payload.altitude_deg) + "°" : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
       }
     }
   }

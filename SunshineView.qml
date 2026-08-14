@@ -12,6 +12,7 @@ Item {
 
   property var bar
   property bool shown: false
+  property int locationEpoch: 0
 
   readonly property int panelWidth: Style.space(340)
 
@@ -35,6 +36,11 @@ Item {
   function refresh() { feed.refresh() }
 
   onShownChanged: if (shown) { view.nowMs = Date.now(); feed.refreshIfStale() }
+  onLocationEpochChanged: {
+    feed.payload = null
+    feed.fetchedAtMs = 0
+    if (shown) feed.refresh()
+  }
 
   implicitHeight: column.implicitHeight
 
@@ -73,57 +79,22 @@ Item {
       font.pixelSize: Style.font.body
     }
 
-    // ---- Hero: the next event and how far away it is.
-    Column {
+    // ---- Header, battery-panel style: the next event as the status
+    //      line, the countdown as the reading.
+    FaceHeader {
       visible: !!view.nextEvent
-      width: parent.width
-      spacing: Style.space(2)
-
-      Row {
-        anchors.horizontalCenter: parent.horizontalCenter
-        spacing: Style.space(14)
-
-        Text {
-          anchors.baseline: heroCountdown.baseline
-          text: view.nextEvent && view.nextEvent.kind === "sunrise" ? "󰖜" : "󰖛"
-          color: view.sunColor
-          font.family: view.fontFamily
-          font.pixelSize: 38
-        }
-
-        Text {
-          id: heroCountdown
-          text: {
-            if (!view.nextEvent) return ""
-            var secs = Model.secondsUntil(view.nextEvent.time, view.nowMs)
-            return isNaN(secs) ? "" : Model.fmtDuration(Math.max(0, secs))
-          }
-          color: view.foreground
-          font.family: view.fontFamily
-          font.pixelSize: 44
-          font.bold: true
-        }
+      icon: view.nextEvent && view.nextEvent.kind === "sunrise" ? "󰖜" : "󰖛"
+      title: "Sunshine"
+      subtitle: view.nextEvent
+        ? ("until " + view.nextEvent.kind + " at " + Model.clockLabel(view.nextEvent.time))
+        : ""
+      bigValue: {
+        if (!view.nextEvent) return ""
+        var secs = Model.secondsUntil(view.nextEvent.time, view.nowMs)
+        return isNaN(secs) ? "" : Model.fmtDuration(Math.max(0, secs))
       }
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        text: {
-          if (!view.nextEvent) return ""
-          var kind = view.nextEvent.kind === "sunrise" ? "until sunrise" : "until sunset"
-          return kind + " at " + Model.clockLabel(view.nextEvent.time)
-        }
-        color: view.foreground
-        font.family: view.fontFamily
-        font.pixelSize: Style.font.body
-      }
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        text: view.payload ? (view.payload.location || "") : ""
-        color: view.muted
-        font.family: view.fontFamily
-        font.pixelSize: Style.font.caption
-      }
+      foreground: view.foreground
+      fontFamily: view.fontFamily
     }
 
     // ---- The arc: today from midnight to midnight, elevation as a sine
@@ -250,40 +221,49 @@ Item {
 
     PanelSeparator { visible: !!view.payload; foreground: view.foreground }
 
-    // ---- Footer: day length and its drift, tomorrow's sunrise, solar noon.
+    // ---- Info grid, battery-panel style: the day's shape in numbers.
     Row {
       visible: !!view.payload
-      anchors.horizontalCenter: parent.horizontalCenter
-      spacing: Style.space(20)
-      bottomPadding: Style.space(4)
+      width: parent.width
+      spacing: Style.space(16)
 
-      GlanceStat {
-        glyph: "󰖨"
-        value: view.payload && view.payload.day_length_seconds !== null
-          ? Model.fmtDuration(view.payload.day_length_seconds)
-            + (Model.fmtDeltaDuration(view.payload.day_length_delta_seconds) !== ""
-               ? " (" + Model.fmtDeltaDuration(view.payload.day_length_delta_seconds) + ")" : "")
-          : ""
-        glyphColor: view.muted
-        valueColor: view.foreground
-        fontFamily: view.fontFamily
+      Column {
+        width: (parent.width - parent.spacing) / 2
+        spacing: Style.space(4)
+
+        InfoPair {
+          label: "Day length"
+          value: view.payload && view.payload.day_length_seconds !== null
+            ? Model.fmtDuration(view.payload.day_length_seconds) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+
+        InfoPair {
+          label: "vs yesterday"
+          value: view.payload ? Model.fmtDeltaDuration(view.payload.day_length_delta_seconds) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
       }
 
-      GlanceStat {
-        glyph: "󰇥"
-        value: view.payload ? Model.clockLabel(view.payload.solar_noon) : ""
-        glyphColor: view.muted
-        valueColor: view.foreground
-        fontFamily: view.fontFamily
-      }
+      Column {
+        width: (parent.width - parent.spacing) / 2
+        spacing: Style.space(4)
 
-      GlanceStat {
-        glyph: "󰖜"
-        value: view.payload && view.payload.tomorrow_sunrise
-          ? "tmrw " + Model.clockLabel(view.payload.tomorrow_sunrise) : ""
-        glyphColor: view.muted
-        valueColor: view.foreground
-        fontFamily: view.fontFamily
+        InfoPair {
+          label: "Solar noon"
+          value: view.payload ? Model.clockLabel(view.payload.solar_noon) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+
+        InfoPair {
+          label: "Sunrise tmrw"
+          value: view.payload ? Model.clockLabel(view.payload.tomorrow_sunrise) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
       }
     }
   }

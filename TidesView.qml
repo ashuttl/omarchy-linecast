@@ -11,6 +11,7 @@ Item {
 
   property var bar
   property bool shown: false
+  property int locationEpoch: 0
 
   readonly property int panelWidth: Style.space(360)
 
@@ -36,6 +37,11 @@ Item {
   }
 
   onShownChanged: if (shown) { view.nowMs = Date.now(); feed.refreshIfStale() }
+  onLocationEpochChanged: {
+    feed.payload = null
+    feed.fetchedAtMs = 0
+    if (shown) feed.refresh()
+  }
 
   implicitHeight: column.implicitHeight
 
@@ -76,60 +82,27 @@ Item {
       font.pixelSize: Style.font.body
     }
 
-    // ---- Hero: the next turn of the tide.
-    Column {
+    // ---- Header, battery-panel style: the next turn as the status line,
+    //      the countdown as the reading.
+    FaceHeader {
       visible: !!view.nextEvent
-      width: parent.width
-      spacing: Style.space(2)
-
-      Row {
-        anchors.horizontalCenter: parent.horizontalCenter
-        spacing: Style.space(14)
-
-        Text {
-          anchors.baseline: heroCountdown.baseline
-          text: view.nextEvent && view.nextEvent.kind === "high" ? "▲" : "▼"
-          color: view.waterColor
-          font.family: view.fontFamily
-          font.pixelSize: 34
-        }
-
-        Text {
-          id: heroCountdown
-          text: {
-            if (!view.nextEvent) return ""
-            var secs = Model.secondsUntil(view.nextEvent.time, view.nowMs)
-            return isNaN(secs) ? "" : Model.fmtDuration(Math.max(0, secs))
-          }
-          color: view.foreground
-          font.family: view.fontFamily
-          font.pixelSize: 44
-          font.bold: true
-        }
+      icon: view.nextEvent && view.nextEvent.kind === "high" ? "▲" : "▼"
+      title: "Tides"
+      subtitle: {
+        if (!view.nextEvent) return ""
+        var kind = view.nextEvent.kind === "high" ? "high" : "low"
+        var line = "until " + kind + " at " + Model.clockLabel(view.nextEvent.time)
+        var h = view.fmtHeight(view.nextEvent.height)
+        if (h !== "") line += " · " + h
+        return line
       }
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        text: {
-          if (!view.nextEvent) return ""
-          var kind = view.nextEvent.kind === "high" ? "until high tide" : "until low tide"
-          var line = kind + " at " + Model.clockLabel(view.nextEvent.time)
-          var h = view.fmtHeight(view.nextEvent.height)
-          if (h !== "") line += " · " + h
-          return line
-        }
-        color: view.foreground
-        font.family: view.fontFamily
-        font.pixelSize: Style.font.body
+      bigValue: {
+        if (!view.nextEvent) return ""
+        var secs = Model.secondsUntil(view.nextEvent.time, view.nowMs)
+        return isNaN(secs) ? "" : Model.fmtDuration(Math.max(0, secs))
       }
-
-      Text {
-        anchors.horizontalCenter: parent.horizontalCenter
-        text: view.payload ? (view.payload.station || "") : ""
-        color: view.muted
-        font.family: view.fontFamily
-        font.pixelSize: Style.font.caption
-      }
+      foreground: view.foreground
+      fontFamily: view.fontFamily
     }
 
     // ---- The curve: series from a few hours back to tomorrow, extremes
@@ -273,6 +246,39 @@ Item {
             font.family: view.fontFamily
             font.pixelSize: Style.font.caption
           }
+        }
+      }
+    }
+
+    PanelSeparator { visible: !!(view.payload && view.payload.station); foreground: view.foreground }
+
+    // ---- Info grid: which water this is, and where it stands.
+    Row {
+      visible: !!(view.payload && view.payload.station)
+      width: parent.width
+      spacing: Style.space(16)
+
+      Column {
+        width: (parent.width - parent.spacing) / 2
+        spacing: Style.space(4)
+
+        InfoPair {
+          label: "Station"
+          value: view.payload ? (view.payload.station || "") : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+      }
+
+      Column {
+        width: (parent.width - parent.spacing) / 2
+        spacing: Style.space(4)
+
+        InfoPair {
+          label: "Now"
+          value: view.payload ? view.fmtHeight(view.payload.now_height) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
         }
       }
     }

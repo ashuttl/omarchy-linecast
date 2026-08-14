@@ -147,6 +147,71 @@ function fmtDeltaDuration(totalSeconds) {
   return (v > 0 ? "+" : "−") + fmtDuration(v)
 }
 
+// Local extrema of a numeric series for chart labeling: a point that is
+// the strict max (or min) of its ±window neighborhood, kept only if it is
+// at least minGap indices from the previous kept extremum of the same
+// kind. Mirrors the TUI's one-label-per-swing look.
+function findExtrema(values, window, minGap) {
+  var out = []
+  var lastMax = -minGap * 2
+  var lastMin = -minGap * 2
+  for (var i = 0; i < values.length; i++) {
+    var v = num(values[i], NaN)
+    if (isNaN(v)) continue
+    var isMax = true, isMin = true
+    for (var j = Math.max(0, i - window); j <= Math.min(values.length - 1, i + window); j++) {
+      if (j === i) continue
+      var u = num(values[j], NaN)
+      if (isNaN(u)) continue
+      if (u >= v) isMax = false
+      if (u <= v) isMin = false
+      if (!isMax && !isMin) break
+    }
+    if (isMax && i - lastMax >= minGap) {
+      out.push({ index: i, kind: "max", value: v })
+      lastMax = i
+    } else if (isMin && i - lastMin >= minGap) {
+      out.push({ index: i, kind: "min", value: v })
+      lastMin = i
+    }
+  }
+  return out
+}
+
+var SNOW_CODES = { 71: 1, 73: 1, 75: 1, 77: 1, 85: 1, 86: 1 }
+var STORM_CODES = { 95: 1, 96: 1, 99: 1 }
+
+// Precipitation color role by WMO code, mirroring the TUI: snow near-white,
+// storms yellow, everything else rain-blue. Returns {r,g,b} 0..1.
+function precipColorFor(code, foreground) {
+  var c = num(code, 0)
+  if (SNOW_CODES[c]) return { r: foreground.r, g: foreground.g, b: foreground.b }
+  if (STORM_CODES[c]) return { r: 0.88, g: 0.76, b: 0.31 }
+  return { r: 0.31, g: 0.56, b: 0.85 }
+}
+
+// The TUI's wind arrows: "N wind blows south", one glyph per 45° sector.
+var WIND_ARROWS = "↓↙←↖↑↗→↘"
+function windArrow(directionDeg) {
+  var d = num(directionDeg, NaN)
+  if (isNaN(d)) return ""
+  return WIND_ARROWS.charAt(Math.round(((d % 360) + 360) % 360 / 45) % 8)
+}
+
+// Wind significance threshold, matching the TUI (15 mph / 25 km/h).
+function windSignificant(speed, windUnit) {
+  var v = num(speed, 0)
+  return v > (String(windUnit || "").indexOf("km") >= 0 ? 25 : 15)
+}
+
+// Daily precip amount label when it clears the TUI's floor (0.05″ / 1 mm).
+function precipAmountLabel(amount, precipUnit) {
+  var v = num(amount, 0)
+  var metric = String(precipUnit || "").indexOf("″") < 0
+  if (v < (metric ? 1 : 0.05)) return ""
+  return (metric ? Math.round(v) : (Math.round(v * 10) / 10)) + String(precipUnit || "")
+}
+
 // "2026-08-27" or a full ISO stamp -> "Aug 27".
 function shortDate(iso) {
   var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""))
