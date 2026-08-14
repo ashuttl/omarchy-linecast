@@ -86,20 +86,40 @@ function severityIsUrgent(severity) {
   return s === "severe" || s === "extreme" || s === "warning"
 }
 
-// Temperature → color, Apple-Weather-style: indigo through teal, green,
-// yellow, orange to red across the livable range. Hue is interpolated in
-// °F regardless of display units so both scales get the same ramp;
-// saturation/lightness are fixed for legibility on the panel background.
-function tempHue(value, tempUnit) {
-  var t = num(value, 60)
-  if (String(tempUnit || "").indexOf("C") >= 0) t = t * 9 / 5 + 32
-  var clamped = Math.min(100, Math.max(5, t))
-  // 5°F → 250 (indigo), ~55°F → ~120 (green), 100°F → 0 (red)
-  return 250 * (1 - (clamped - 5) / 95)
-}
+// Temperature → color, mirroring linecast's own TEMP_COLORS stops
+// (_weather_style.py): the ramp lingers in the cool band and turns over
+// quickly through the warm one, so 72°F is already yellow and 82°F
+// orange — a linear hue sweep leaves whole forecasts green. The TUI
+// samples theme ANSI colors for its anchors; the panel uses fixed RGBs
+// in the same roles. Stops are in °F; Celsius payloads convert first.
+var TEMP_STOPS = [
+  [0,  0.42, 0.55, 0.85],  // deep blue
+  [32, 0.31, 0.56, 0.85],  // blue
+  [45, 0.25, 0.75, 0.75],  // cyan
+  [55, 0.35, 0.77, 0.44],  // green
+  [65, 0.66, 0.79, 0.31],  // green-yellow
+  [72, 0.88, 0.76, 0.31],  // yellow
+  [82, 0.91, 0.60, 0.31],  // orange
+  [95, 0.88, 0.36, 0.31],  // red
+]
 
 function tempColor(value, tempUnit) {
-  return Qt.hsla(tempHue(value, tempUnit) / 360, 0.6, 0.6, 1)
+  var t = num(value, 60)
+  if (String(tempUnit || "").indexOf("C") >= 0) t = t * 9 / 5 + 32
+  var stops = TEMP_STOPS
+  if (t <= stops[0][0]) return Qt.rgba(stops[0][1], stops[0][2], stops[0][3], 1)
+  var last = stops[stops.length - 1]
+  if (t >= last[0]) return Qt.rgba(last[1], last[2], last[3], 1)
+  for (var i = 0; i < stops.length - 1; i++) {
+    var a = stops[i], b = stops[i + 1]
+    if (t >= a[0] && t <= b[0]) {
+      var f = (t - a[0]) / (b[0] - a[0])
+      return Qt.rgba(a[1] + (b[1] - a[1]) * f,
+                     a[2] + (b[2] - a[2]) * f,
+                     a[3] + (b[3] - a[3]) * f, 1)
+    }
+  }
+  return Qt.rgba(last[1], last[2], last[3], 1)
 }
 
 function windLine(current, units) {

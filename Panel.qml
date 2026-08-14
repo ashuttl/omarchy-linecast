@@ -304,15 +304,16 @@ Panel {
                   radius: width / 2
                   height: Style.space(8)
                     + Model.extentPos(modelData.temperature, root.hourExtent) * (parent.height - Style.space(8))
+                  id: hourBar
+
+                  readonly property real tipT: Model.num(modelData.temperature, 60)
+                  readonly property real baseT: root.hourExtent.min
+                  readonly property string tUnit: root.units ? root.units.temperature : ""
+
                   gradient: Gradient {
-                    GradientStop {
-                      position: 0
-                      color: Model.tempColor(modelData.temperature, root.units ? root.units.temperature : "")
-                    }
-                    GradientStop {
-                      position: 1
-                      color: Model.tempColor(root.hourExtent.min, root.units ? root.units.temperature : "")
-                    }
+                    GradientStop { position: 0.0; color: Model.tempColor(hourBar.tipT, hourBar.tUnit) }
+                    GradientStop { position: 0.5; color: Model.tempColor(hourBar.baseT + (hourBar.tipT - hourBar.baseT) * 0.5, hourBar.tUnit) }
+                    GradientStop { position: 1.0; color: Model.tempColor(hourBar.baseT, hourBar.tUnit) }
                   }
                 }
               }
@@ -408,16 +409,27 @@ Panel {
                     - Model.extentPos(modelData.low, root.weekExtent)) * parent.width)
                   height: parent.height
                   radius: height / 2
+                  // Stops sample the ramp along the way rather than lerping
+                  // straight from low color to high color — a 51°–78° day
+                  // passes through green and yellow like the TUI, instead of
+                  // a teal-to-orange shortcut across RGB space.
+                  id: rangeFill
+
+                  readonly property real lowT: Model.num(modelData.low, 60)
+                  readonly property real highT: Model.num(modelData.high, 60)
+                  readonly property string tUnit: root.units ? root.units.temperature : ""
+
+                  function rampAt(f) {
+                    return Model.tempColor(rangeFill.lowT + (rangeFill.highT - rangeFill.lowT) * f, rangeFill.tUnit)
+                  }
+
                   gradient: Gradient {
                     orientation: Gradient.Horizontal
-                    GradientStop {
-                      position: 0
-                      color: Model.tempColor(modelData.low, root.units ? root.units.temperature : "")
-                    }
-                    GradientStop {
-                      position: 1
-                      color: Model.tempColor(modelData.high, root.units ? root.units.temperature : "")
-                    }
+                    GradientStop { position: 0.00; color: rangeFill.rampAt(0.00) }
+                    GradientStop { position: 0.25; color: rangeFill.rampAt(0.25) }
+                    GradientStop { position: 0.50; color: rangeFill.rampAt(0.50) }
+                    GradientStop { position: 0.75; color: rangeFill.rampAt(0.75) }
+                    GradientStop { position: 1.00; color: rangeFill.rampAt(1.00) }
                   }
                 }
               }
