@@ -102,7 +102,10 @@ BarWidget {
     if (panelLoader.item) panelLoader.item.toggle()
   }
 
-  readonly property real openPanelIndicatorWidth: pillFor(activeSection).labelWidth
+  // The bar centers the open-panel mark on the whole slot and takes only
+  // a width hint, so a pill-sized mark can't sit under its pill when the
+  // extras are out — span the row instead so centered is also aligned.
+  readonly property real openPanelIndicatorWidth: pillRow.implicitWidth
   readonly property real openPanelIndicatorHeight: Math.max(Style.space(10), Math.round(Style.bar.iconSlot * 0.55))
 
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
