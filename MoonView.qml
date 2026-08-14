@@ -54,6 +54,13 @@ Item {
       function onPayloadChanged() { disc.requestPaint() }
     }
 
+    // The disc reads foreground imperatively in onPaint; a theme swap
+    // needs an explicit repaint.
+    Connections {
+      target: view
+      function onForegroundChanged() { disc.requestPaint() }
+    }
+
     onPaint: {
       var ctx = getContext("2d")
       ctx.clearRect(0, 0, width, height)

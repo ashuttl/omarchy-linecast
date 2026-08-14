@@ -37,6 +37,11 @@ Item {
   }
 
   onShownChanged: if (shown) { view.nowMs = Date.now(); feed.refreshIfStale() }
+  // The canvas reads foreground, accent, and the font imperatively in
+  // onPaint; a theme swap needs an explicit repaint.
+  onForegroundChanged: chart.requestPaint()
+  onWaterColorChanged: chart.requestPaint()
+  onFontFamilyChanged: chart.requestPaint()
   onLocationEpochChanged: {
     feed.payload = null
     feed.fetchedAtMs = 0

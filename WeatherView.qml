@@ -18,6 +18,11 @@ Item {
   property bool shown: false
   property var host: null
   property int locationEpoch: 0
+  // ThemePalette from the panel; null falls back to the fixed ramp.
+  property var palette: null
+
+  readonly property var tempStops: palette ? palette.tempStops : null
+  readonly property var themeColors: palette ? palette.colors : null
 
   signal locationChangedByUser()
 
@@ -51,6 +56,11 @@ Item {
     if (shown) feed.refreshIfStale()
     else view.locMenuOpen = false
   }
+  // A theme swap flows into the declarative bindings on its own, but the
+  // canvas reads its colors and font imperatively in onPaint — nudge it.
+  onForegroundChanged: hourlyChart.requestPaint()
+  onFontFamilyChanged: hourlyChart.requestPaint()
+  onTempStopsChanged: hourlyChart.requestPaint()
   onLocationEpochChanged: {
     feed.payload = null
     feed.fetchedAtMs = 0
@@ -274,7 +284,7 @@ Item {
 
         readonly property string tone: Model.severityTone(modelData.severity)
         readonly property color toneColor: tone === "severe" ? view.urgent
-          : tone === "moderate" ? Model.tempColor(74, "°F")
+          : tone === "moderate" ? Model.tempColor(74, "°F", view.tempStops)
           : view.muted
 
         width: column.width
@@ -458,7 +468,7 @@ Item {
           for (var p = 0; p < n; p++) {
             var prob = Model.num(hours[p].precipitation_probability, 0)
             if (prob < 15) continue
-            var pc = Model.precipColorFor(hours[p].weather_code, view.foreground)
+            var pc = Model.precipColorFor(hours[p].weather_code, view.foreground, view.themeColors)
             ctx.fillStyle = Qt.rgba(pc.r, pc.g, pc.b, 0.4)
             var ph = prob / 100 * 26
             ctx.fillRect(p * hourW + hourW * 0.2, plotBottom - ph, hourW * 0.6, ph)
@@ -469,7 +479,7 @@ Item {
           ctx.lineCap = "round"
           for (var s = 1; s < n; s++) {
             if (isNaN(temps[s - 1]) || isNaN(temps[s])) continue
-            ctx.strokeStyle = Model.tempColor((temps[s - 1] + temps[s]) / 2, view.tempUnit)
+            ctx.strokeStyle = Model.tempColor((temps[s - 1] + temps[s]) / 2, view.tempUnit, view.tempStops)
             ctx.beginPath()
             ctx.moveTo(xAt(s - 1), yAt(temps[s - 1]))
             ctx.lineTo(xAt(s), yAt(temps[s]))
@@ -493,7 +503,7 @@ Item {
             var lw = ctx.measureText(label).width
             var lx = Math.max(2, Math.min(width - lw - 2, xAt(ex.index) - lw / 2))
             var ly = ex.kind === "max" ? yAt(ex.value) - 6 : yAt(ex.value) + capF + 4
-            ctx.fillStyle = Model.tempColor(ex.value, view.tempUnit)
+            ctx.fillStyle = Model.tempColor(ex.value, view.tempUnit, view.tempStops)
             ctx.fillText(label, lx, ly)
           }
 
@@ -520,7 +530,7 @@ Item {
               v++
             }
             var utext = "UV" + Math.round(peakV)
-            ctx.fillStyle = Model.tempColor(88, "°F")
+            ctx.fillStyle = Model.tempColor(88, "°F", view.tempStops)
             ctx.fillText(utext, Math.max(2, xAt(peakI) - ctx.measureText(utext).width / 2), annoY1)
             u = v
           }
@@ -587,7 +597,7 @@ Item {
               Text {
                 text: hourlyChart.hoverHour ? Model.roundTemp(hourlyChart.hoverHour.temperature) : ""
                 color: hourlyChart.hoverHour
-                  ? Model.tempColor(hourlyChart.hoverHour.temperature, view.tempUnit)
+                  ? Model.tempColor(hourlyChart.hoverHour.temperature, view.tempUnit, view.tempStops)
                   : Color.tooltip.text
                 font.family: view.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -613,7 +623,11 @@ Item {
             Text {
               visible: hourlyChart.hoverHour && Model.num(hourlyChart.hoverHour.precipitation_probability, 0) >= 15
               text: hourlyChart.hoverHour ? Math.round(Model.num(hourlyChart.hoverHour.precipitation_probability, 0)) + "% precip" : ""
-              color: Qt.rgba(0.31, 0.56, 0.85, 1)
+              color: {
+                var pc = Model.precipColorFor(hourlyChart.hoverHour ? hourlyChart.hoverHour.weather_code : 0,
+                                              Color.tooltip.text, view.themeColors)
+                return Qt.rgba(pc.r, pc.g, pc.b, 1)
+              }
               font.family: view.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
@@ -715,7 +729,8 @@ Item {
               // Stops sample the ramp along the way rather than lerping
               // endpoint colors straight across RGB space.
               function rampAt(f) {
-                return Model.tempColor(rangeFill.lowT + (rangeFill.highT - rangeFill.lowT) * f, view.tempUnit)
+                return Model.tempColor(rangeFill.lowT + (rangeFill.highT - rangeFill.lowT) * f,
+                                       view.tempUnit, view.tempStops)
               }
 
               gradient: Gradient {
@@ -751,7 +766,7 @@ Item {
               text: dayRow.precipLabel
               visible: text !== ""
               color: {
-                var pc = Model.precipColorFor(dayRow.modelData.weather_code, view.foreground)
+                var pc = Model.precipColorFor(dayRow.modelData.weather_code, view.foreground, view.themeColors)
                 return Qt.rgba(pc.r, pc.g, pc.b, 1)
               }
               font.family: view.fontFamily

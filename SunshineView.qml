@@ -13,6 +13,8 @@ Item {
   property var bar
   property bool shown: false
   property int locationEpoch: 0
+  // ThemePalette from the panel; null falls back to the fixed ramp.
+  property var palette: null
 
   readonly property int panelWidth: Style.space(340)
 
@@ -21,7 +23,7 @@ Item {
   readonly property color muted: Qt.darker(foreground, 1.4)
   // The sun keeps the ramp's warm anchor rather than the theme accent, so
   // the arc reads "sun" in any theme.
-  readonly property color sunColor: Model.tempColor(78, "°F")
+  readonly property color sunColor: Model.tempColor(78, "°F", palette ? palette.tempStops : null)
 
   readonly property var payload: feed.payload
 
@@ -36,6 +38,10 @@ Item {
   function refresh() { feed.refresh() }
 
   onShownChanged: if (shown) { view.nowMs = Date.now(); feed.refreshIfStale() }
+  // The canvas reads foreground and the sun color imperatively in
+  // onPaint; a theme swap needs an explicit repaint.
+  onForegroundChanged: arc.requestPaint()
+  onSunColorChanged: arc.requestPaint()
   onLocationEpochChanged: {
     feed.payload = null
     feed.fetchedAtMs = 0

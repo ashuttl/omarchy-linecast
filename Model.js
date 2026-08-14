@@ -125,9 +125,10 @@ function shortLocation(label) {
 // Temperature → color, mirroring linecast's own TEMP_COLORS stops
 // (_weather_style.py): the ramp lingers in the cool band and turns over
 // quickly through the warm one, so 72°F is already yellow and 82°F
-// orange — a linear hue sweep leaves whole forecasts green. The TUI
-// samples theme ANSI colors for its anchors; the panel uses fixed RGBs
-// in the same roles. Stops are in °F; Celsius payloads convert first.
+// orange — a linear hue sweep leaves whole forecasts green. Like the
+// TUI, the anchors sample the theme's ANSI colors (buildTempStops);
+// these fixed RGBs are the fallback when no theme palette is readable.
+// Stops are in °F; Celsius payloads convert first.
 var TEMP_STOPS = [
   [0,  0.42, 0.55, 0.85],  // deep blue
   [32, 0.31, 0.56, 0.85],  // blue
@@ -139,10 +140,91 @@ var TEMP_STOPS = [
   [95, 0.88, 0.36, 0.31],  // red
 ]
 
-function tempColor(value, tempUnit) {
+// colors.toml -> { name: "#rrggbb" }, or null when nothing parses (same
+// line shape the shell's Color singleton reads).
+function parseColorsToml(raw) {
+  var out = null
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9A-Fa-f]{6})/)
+    if (m) {
+      if (!out) out = {}
+      out[m[1]] = m[2]
+    }
+  }
+  return out
+}
+
+function hexToRgb(hex) {
+  var m = /^#([0-9A-Fa-f]{6})$/.exec(String(hex || ""))
+  if (!m) return null
+  return {
+    r: parseInt(m[1].slice(0, 2), 16) / 255,
+    g: parseInt(m[1].slice(2, 4), 16) / 255,
+    b: parseInt(m[1].slice(4, 6), 16) / 255
+  }
+}
+
+function contrastRatio(a, b) {
+  function lum(c) {
+    function ch(v) { return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4) }
+    return 0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b)
+  }
+  var la = lum(a), lb = lum(b)
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+}
+
+// A ramp anchor from the theme: the plain ANSI color when it reads
+// against the background, its bright twin when it doesn't — the TUI's
+// best_contrast pick. New-format themes name their colors; generated
+// palettes (colors-from-alacritty) only have color0..15 slots.
+var ANSI_SLOT = { red: 1, green: 2, yellow: 3, blue: 4, magenta: 5, cyan: 6 }
+
+function themeAnchor(colors, name, bg, fallback) {
+  var slot = ANSI_SLOT[name]
+  var plain = colors
+    ? hexToRgb(colors[name]) || (slot ? hexToRgb(colors["color" + slot]) : null)
+    : null
+  var bright = colors
+    ? hexToRgb(colors["bright_" + name]) || (slot ? hexToRgb(colors["color" + (slot + 8)]) : null)
+    : null
+  if (plain && (!bg || contrastRatio(plain, bg) >= 2.1)) return plain
+  if (bright && (!bg || contrastRatio(bright, bg) >= 2.1)) return bright
+  if (plain && bright && bg)
+    return contrastRatio(plain, bg) >= contrastRatio(bright, bg) ? plain : bright
+  return plain || bright || fallback
+}
+
+// The TUI's TEMP_COLORS built from a parsed theme palette; the fixed
+// stops when there is none.
+function buildTempStops(colors, background) {
+  if (!colors) return TEMP_STOPS
+  var bg = background ? { r: background.r, g: background.g, b: background.b } : null
+  var blue = themeAnchor(colors, "blue", bg, { r: 0.31, g: 0.56, b: 0.85 })
+  var cyan = themeAnchor(colors, "cyan", bg, { r: 0.25, g: 0.75, b: 0.75 })
+  var green = themeAnchor(colors, "green", bg, { r: 0.35, g: 0.77, b: 0.44 })
+  var yellow = themeAnchor(colors, "yellow", bg, { r: 0.88, g: 0.76, b: 0.31 })
+  var red = themeAnchor(colors, "red", bg, { r: 0.88, g: 0.36, b: 0.31 })
+  function mix(a, b, f) {
+    return { r: a.r + (b.r - a.r) * f, g: a.g + (b.g - a.g) * f, b: a.b + (b.b - a.b) * f }
+  }
+  function stop(t, c) { return [t, c.r, c.g, c.b] }
+  return [
+    stop(0, mix(blue, cyan, 0.15)),
+    stop(32, blue),
+    stop(45, cyan),
+    stop(55, green),
+    stop(65, mix(green, yellow, 0.45)),
+    stop(72, yellow),
+    stop(82, mix(yellow, red, 0.45)),
+    stop(95, red),
+  ]
+}
+
+function tempColor(value, tempUnit, themeStops) {
   var t = num(value, 60)
   if (String(tempUnit || "").indexOf("C") >= 0) t = t * 9 / 5 + 32
-  var stops = TEMP_STOPS
+  var stops = themeStops || TEMP_STOPS
   if (t <= stops[0][0]) return Qt.rgba(stops[0][1], stops[0][2], stops[0][3], 1)
   var last = stops[stops.length - 1]
   if (t >= last[0]) return Qt.rgba(last[1], last[2], last[3], 1)
@@ -218,12 +300,12 @@ var SNOW_CODES = { 71: 1, 73: 1, 75: 1, 77: 1, 85: 1, 86: 1 }
 var STORM_CODES = { 95: 1, 96: 1, 99: 1 }
 
 // Precipitation color role by WMO code, mirroring the TUI: snow near-white,
-// storms yellow, everything else rain-blue. Returns {r,g,b} 0..1.
-function precipColorFor(code, foreground) {
+// storms theme-yellow, everything else theme-blue. Returns {r,g,b} 0..1.
+function precipColorFor(code, foreground, colors) {
   var c = num(code, 0)
   if (SNOW_CODES[c]) return { r: foreground.r, g: foreground.g, b: foreground.b }
-  if (STORM_CODES[c]) return { r: 0.88, g: 0.76, b: 0.31 }
-  return { r: 0.31, g: 0.56, b: 0.85 }
+  if (STORM_CODES[c]) return themeAnchor(colors, "yellow", null, { r: 0.88, g: 0.76, b: 0.31 })
+  return themeAnchor(colors, "blue", null, { r: 0.31, g: 0.56, b: 0.85 })
 }
 
 // The TUI's wind arrows: "N wind blows south", one glyph per 45° sector.

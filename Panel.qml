@@ -29,6 +29,10 @@ Panel {
   // drops its payload and refetches for the new place.
   property int locationEpoch: 0
 
+  // Shared theme sampler: the temperature ramp anchored on the current
+  // theme's ANSI colors, TUI style.
+  property ThemePalette themePalette: ThemePalette {}
+
   readonly property var activeView: section === "sunshine" ? sunshineView
     : section === "moon" ? moonView
     : section === "tides" ? tidesView
@@ -124,6 +128,7 @@ Panel {
         width: parent.width
         bar: root.bar
         host: root
+        palette: root.themePalette
         locationEpoch: root.locationEpoch
         visible: root.section === "weather"
         shown: visible && root.opened
@@ -140,6 +145,7 @@ Panel {
         id: sunshineView
         width: parent.width
         bar: root.bar
+        palette: root.themePalette
         locationEpoch: root.locationEpoch
         visible: root.section === "sunshine"
         shown: visible && root.opened
