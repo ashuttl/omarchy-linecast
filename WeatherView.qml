@@ -4,12 +4,12 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Weather face of the linecast panel, composed the way the stock panels
-// are: header with a small-caps status line and a display-sized reading,
-// two-column info grid, section headers between rules. The body is the
-// TUI's hourly chart translated to pixels — a scrollable temperature line
-// with labels at the extrema, precipitation bars, day shading, and UV /
-// wind annotations where they matter — over the week's range bars.
+// Weather face of the linecast panel. The header leads with the place —
+// clicking it reveals the location menu (recents, auto, search) — over
+// the TUI's hourly chart translated to pixels: a scrollable, hoverable
+// temperature line with labels at the extrema, precipitation bars, day
+// shading, and UV / wind annotations where they matter. Alerts wear the
+// TUI's severity badges and expand to their full text on click.
 // Fed by `linecast weather --json`.
 Item {
   id: view
@@ -27,6 +27,7 @@ Item {
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color muted: Qt.darker(foreground, 1.4)
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
 
   readonly property var payload: feed.payload
   readonly property var current: payload ? payload.current : null
@@ -42,9 +43,14 @@ Item {
 
   readonly property var recentLocations: host ? host.setting("recentLocations", []) : []
 
+  property bool locMenuOpen: false
+
   function refresh() { feed.refresh() }
 
-  onShownChanged: if (shown) feed.refreshIfStale()
+  onShownChanged: {
+    if (shown) feed.refreshIfStale()
+    else view.locMenuOpen = false
+  }
   onLocationEpochChanged: {
     feed.payload = null
     feed.fetchedAtMs = 0
@@ -122,6 +128,7 @@ Item {
       rememberLocation(entry)
       view.searchResults = []
       searchField.text = ""
+      view.locMenuOpen = false
       view.locationChangedByUser()
     })
   }
@@ -129,6 +136,7 @@ Item {
   function applyAutoLocation() {
     runLoc("linecast location auto >/dev/null 2>&1; echo done", function() {
       view.searchResults = []
+      view.locMenuOpen = false
       view.locationChangedByUser()
     })
   }
@@ -151,12 +159,12 @@ Item {
       font.pixelSize: Style.font.body
     }
 
-    // ---- Header, battery-panel style: condition as the status line, the
-    //      temperature as the reading.
+    // ---- Header: the place leads, and is the location menu's trigger.
     FaceHeader {
       visible: !!view.current
       icon: view.current ? (view.current.icon || "") : ""
-      title: "Weather"
+      title: view.payload && view.payload.location !== ""
+        ? Model.shortLocation(view.payload.location) : "Weather"
       subtitle: {
         if (!view.current) return ""
         var line = view.current.condition || ""
@@ -169,10 +177,81 @@ Item {
       bigValue: view.current ? Model.roundTemp(view.current.temperature) : ""
       foreground: view.foreground
       fontFamily: view.fontFamily
+      interactive: true
+      onClicked: view.locMenuOpen = !view.locMenuOpen
+    }
+
+    // ---- The location menu: revealed under the header, list-style like
+    //      the shell's device lists. Recents, auto, and a search field.
+    Column {
+      visible: view.locMenuOpen
+      width: parent.width
+
+      Repeater {
+        model: view.recentLocations
+
+        Button {
+          required property var modelData
+          width: column.width
+          text: Model.shortLocation(modelData.label)
+          iconText: view.payload && view.payload.location === modelData.label ? "󰄬" : "󰍎"
+          fontSize: Style.font.body
+          leftAlign: true
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+          onClicked: view.applyLocation(modelData)
+        }
+      }
+
+      Button {
+        width: column.width
+        text: "Auto (IP geolocation)"
+        iconText: "󰆤"
+        fontSize: Style.font.body
+        leftAlign: true
+        foreground: view.foreground
+        fontFamily: view.fontFamily
+        onClicked: view.applyAutoLocation()
+      }
+
+      Item { width: 1; height: Style.space(6) }
+
+      TextField {
+        id: searchField
+        width: parent.width
+        foreground: view.foreground
+        placeholderText: "Add location… (Enter to search)"
+        onAccepted: view.searchLocations(text)
+      }
+
+      Text {
+        visible: view.locBusy
+        topPadding: Style.space(4)
+        text: "Looking…"
+        color: view.muted
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Repeater {
+        model: view.searchResults
+
+        Button {
+          required property var modelData
+          width: column.width
+          text: modelData.label
+          iconText: "󰍎"
+          fontSize: Style.font.body
+          leftAlign: true
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+          onClicked: view.applyLocation(modelData)
+        }
+      }
     }
 
     Text {
-      visible: !!(view.payload && view.payload.summary)
+      visible: !!(view.payload && view.payload.summary) && !view.locMenuOpen
       width: parent.width
       wrapMode: Text.WordWrap
       text: view.payload ? (view.payload.summary || "") : ""
@@ -182,44 +261,108 @@ Item {
       font.italic: true
     }
 
+    // ---- Alerts, TUI style: a severity badge with the timeframe and a
+    //      taste of the text; the full text on click.
     Repeater {
       model: view.alerts
 
-      Row {
-        required property var modelData
-        width: column.width
-        spacing: Style.space(8)
+      Column {
+        id: alertItem
 
-        Text {
-          text: ""
-          color: Model.severityIsUrgent(modelData.severity) ? (view.bar ? view.bar.urgent : Color.urgent) : view.foreground
-          font.family: view.fontFamily
-          font.pixelSize: Style.font.body
+        required property var modelData
+        property bool expanded: false
+
+        readonly property string tone: Model.severityTone(modelData.severity)
+        readonly property color toneColor: tone === "severe" ? view.urgent
+          : tone === "moderate" ? Model.tempColor(74, "°F")
+          : view.muted
+
+        width: column.width
+        spacing: Style.space(6)
+
+        Item {
+          width: parent.width
+          height: badge.height
+
+          Rectangle {
+            id: badge
+            color: alertItem.toneColor
+            width: badgeText.implicitWidth + Style.space(12)
+            height: badgeText.implicitHeight + Style.space(4)
+
+            Text {
+              id: badgeText
+              anchors.centerIn: parent
+              text: "󰀦 " + (alertItem.modelData.event || alertItem.modelData.headline || "Alert")
+              color: Color.background
+              font.family: view.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+          }
+
+          Text {
+            id: alertWhen
+            anchors.verticalCenter: parent.verticalCenter
+            x: badge.width + Style.space(8)
+            text: Model.alertTimeframe(alertItem.modelData.effective, alertItem.modelData.expires, Qt.locale())
+            color: view.muted
+            font.family: view.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            anchors.verticalCenter: parent.verticalCenter
+            x: alertWhen.x + alertWhen.implicitWidth + (alertWhen.text !== "" ? Style.space(8) : 0)
+            width: Math.max(0, parent.width - x)
+            visible: !alertItem.expanded
+            text: String(alertItem.modelData.description || "").replace(/\s+/g, " ")
+            elide: Text.ElideRight
+            color: view.muted
+            font.family: view.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: alertItem.expanded = !alertItem.expanded
+          }
         }
 
         Text {
-          width: parent.width - x
-          text: modelData.event || modelData.headline || ""
-          elide: Text.ElideRight
-          color: Model.severityIsUrgent(modelData.severity) ? (view.bar ? view.bar.urgent : Color.urgent) : view.foreground
+          visible: alertItem.expanded
+          width: parent.width
+          text: String(alertItem.modelData.description || "")
+          wrapMode: Text.WordWrap
+          color: view.foreground
           font.family: view.fontFamily
-          font.pixelSize: Style.font.body
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        Text {
+          visible: alertItem.expanded && !!alertItem.modelData.url
+          text: String(alertItem.modelData.url || "")
+          elide: Text.ElideMiddle
+          width: parent.width
+          color: Color.accent
+          font.family: view.fontFamily
+          font.pixelSize: Style.font.bodySmall
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: Qt.openUrlExternally(alertItem.modelData.url)
+          }
         }
       }
     }
 
     PanelSeparator { visible: view.hourly.length > 2; foreground: view.foreground }
 
-    PanelSectionHeader {
-      visible: view.hourly.length > 2
-      text: "HOURLY"
-      foreground: view.foreground
-      fontFamily: view.fontFamily
-    }
-
     // ---- The hourly chart: 24 hours in view, the whole forecast on
-    //      scroll. Line plot over day-shaded bands with precip bars
-    //      beneath the curve and UV / wind rows under the axis.
+    //      scroll, a chip on hover. Type sits on the body scale so the
+    //      chart reads as part of the panel, not a miniature of it.
     Flickable {
       id: hourlyFlick
       visible: view.hourly.length > 2
@@ -233,15 +376,21 @@ Item {
       Canvas {
         id: hourlyChart
 
+        readonly property real capF: Style.font.caption
         readonly property real hourW: column.width / 24
-        readonly property real plotTop: 18
-        readonly property real plotBottom: 96
-        readonly property real axisY: 112
-        readonly property real annoY1: 128
-        readonly property real annoY2: 142
+        readonly property real plotTop: capF + 12
+        readonly property real plotBottom: plotTop + 76
+        readonly property real axisY: plotBottom + capF + 6
+        readonly property real annoY1: axisY + capF + 5
+        readonly property real annoY2: annoY1 + capF + 4
+
+        readonly property int hoverIndex: chartMouse.containsMouse
+          ? Math.max(0, Math.min(view.hourly.length - 1, Math.floor(chartMouse.mouseX / hourW)))
+          : -1
+        readonly property var hoverHour: hoverIndex >= 0 ? view.hourly[hoverIndex] : null
 
         width: Math.max(column.width, view.hourly.length * hourW)
-        height: 148
+        height: annoY2 + 4
 
         onWidthChanged: requestPaint()
 
@@ -262,7 +411,7 @@ Item {
           var ext = Model.tempExtent(hours, "temperature")
           // The curve keeps clear of the plot edges so extrema labels have
           // room above the peaks and below the troughs.
-          var yPad = 10
+          var yPad = capF + 2
           function xAt(i) { return (i + 0.5) * hourW }
           function yAt(t) {
             return (plotBottom - yPad)
@@ -270,8 +419,7 @@ Item {
           }
 
           // Day/night bands + midnight rules, from the daily sunrise/sunset
-          // pairs. Sun-up hours get a faint lift, midnights a rule and the
-          // day's name.
+          // pairs.
           var dayMap = {}
           for (var d = 0; d < view.dailyRows.length; d++) {
             var day = view.dailyRows[d]
@@ -289,19 +437,19 @@ Item {
               ctx.fillRect(b * hourW, plotTop - 6, hourW + 0.5, plotBottom - plotTop + 6)
           }
 
-          ctx.font = "9px " + view.fontFamily
+          ctx.font = capF + "px " + view.fontFamily
           for (var m2 = 1; m2 < n; m2++) {
             var hh = String(hours[m2].time || "").slice(11, 13)
             if (hh === "00") {
               ctx.strokeStyle = Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.14)
               ctx.lineWidth = 1
               ctx.beginPath()
-              ctx.moveTo(m2 * hourW, plotTop - 12)
+              ctx.moveTo(m2 * hourW, plotTop - capF - 4)
               ctx.lineTo(m2 * hourW, plotBottom + 4)
               ctx.stroke()
               ctx.fillStyle = view.foreground
               ctx.fillText(Model.dayLabel(String(hours[m2].time).slice(0, 10), 1, Qt.locale()),
-                           m2 * hourW + 3, 10)
+                           m2 * hourW + 4, capF)
             }
           }
 
@@ -337,30 +485,30 @@ Item {
           }
 
           // Extrema labels, one per swing like the TUI.
-          ctx.font = "bold 10px " + view.fontFamily
+          ctx.font = "bold " + capF + "px " + view.fontFamily
           var extrema = Model.findExtrema(temps, 5, 6)
           for (var e = 0; e < extrema.length; e++) {
             var ex = extrema[e]
             var label = Math.round(ex.value) + "°"
             var lw = ctx.measureText(label).width
             var lx = Math.max(2, Math.min(width - lw - 2, xAt(ex.index) - lw / 2))
-            var ly = ex.kind === "max" ? yAt(ex.value) - 6 : yAt(ex.value) + 13
+            var ly = ex.kind === "max" ? yAt(ex.value) - 6 : yAt(ex.value) + capF + 4
             ctx.fillStyle = Model.tempColor(ex.value, view.tempUnit)
             ctx.fillText(label, lx, ly)
           }
 
           // Hour axis, every three hours.
-          ctx.font = "9px " + view.fontFamily
+          ctx.font = capF + "px " + view.fontFamily
           ctx.fillStyle = view.muted
           for (var a = 0; a < n; a += 1) {
             var ah = Number(String(hours[a].time || "").slice(11, 13))
             if (a !== 0 && (ah % 3 !== 0 || a < 2)) continue
             var atext = a === 0 ? "now" : Model.hourLabel(hours[a].time)
-            ctx.fillText(atext, xAt(a) - ctx.measureText(atext).width / 2, axisY)
+            ctx.fillText(atext, Math.max(2, xAt(a) - ctx.measureText(atext).width / 2), axisY)
           }
 
           // UV row: label the peak of each remarkable (>= 6) stretch.
-          ctx.font = "bold 9px " + view.fontFamily
+          ctx.font = "bold " + capF + "px " + view.fontFamily
           var u = 0
           while (u < n) {
             var uv = Model.num(hours[u].uv_index, 0)
@@ -379,7 +527,7 @@ Item {
 
           // Wind row: arrow and speed where it blows hard enough to matter,
           // at most one label per three hours.
-          ctx.font = "9px " + view.fontFamily
+          ctx.font = capF + "px " + view.fontFamily
           ctx.fillStyle = view.muted
           for (var w2 = 0; w2 < n; w2 += 3) {
             var ws = Model.num(hours[w2].wind_speed, 0)
@@ -388,21 +536,96 @@ Item {
             ctx.fillText(wtext, Math.max(2, xAt(w2) - ctx.measureText(wtext).width / 2), annoY2)
           }
         }
+
+        // Hover only — no buttons accepted, so horizontal flicks still
+        // reach the Flickable underneath.
+        MouseArea {
+          id: chartMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          acceptedButtons: Qt.NoButton
+        }
+
+        Rectangle {
+          visible: hourlyChart.hoverIndex >= 0
+          x: (hourlyChart.hoverIndex + 0.5) * hourlyChart.hourW
+          y: hourlyChart.plotTop - 4
+          width: 1
+          height: hourlyChart.plotBottom - hourlyChart.plotTop + 8
+          color: Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.3)
+        }
+
+        // The chip, TUI style: time, temperature (feels), condition.
+        Rectangle {
+          id: hoverChip
+          visible: hourlyChart.hoverHour !== null
+          x: Math.max(hourlyFlick.contentX + 4,
+             Math.min(hourlyFlick.contentX + hourlyFlick.width - width - 4,
+                      chartMouse.mouseX + Style.space(14)))
+          y: hourlyChart.plotTop
+          width: chipColumn.implicitWidth + Style.space(16)
+          height: chipColumn.implicitHeight + Style.space(12)
+          color: Color.tooltip.background
+          border.color: Color.tooltip.border
+          border.width: 1
+
+          Column {
+            id: chipColumn
+            anchors.centerIn: parent
+            spacing: Style.space(1)
+
+            Text {
+              text: hourlyChart.hoverHour ? Model.clockLabel(hourlyChart.hoverHour.time) : ""
+              color: Color.tooltip.text
+              font.family: view.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Row {
+              spacing: Style.space(5)
+
+              Text {
+                text: hourlyChart.hoverHour ? Model.roundTemp(hourlyChart.hoverHour.temperature) : ""
+                color: hourlyChart.hoverHour
+                  ? Model.tempColor(hourlyChart.hoverHour.temperature, view.tempUnit)
+                  : Color.tooltip.text
+                font.family: view.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              Text {
+                visible: hourlyChart.hoverHour && Model.num(hourlyChart.hoverHour.feels_like, NaN) === Model.num(hourlyChart.hoverHour.feels_like, NaN)
+                text: hourlyChart.hoverHour ? "feels " + Model.roundTemp(hourlyChart.hoverHour.feels_like) : ""
+                color: Qt.darker(Color.tooltip.text, 1.3)
+                font.family: view.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+
+            Text {
+              text: hourlyChart.hoverHour ? (hourlyChart.hoverHour.condition || "") : ""
+              color: Color.tooltip.text
+              font.family: view.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              visible: hourlyChart.hoverHour && Model.num(hourlyChart.hoverHour.precipitation_probability, 0) >= 15
+              text: hourlyChart.hoverHour ? Math.round(Model.num(hourlyChart.hoverHour.precipitation_probability, 0)) + "% precip" : ""
+              color: Qt.rgba(0.31, 0.56, 0.85, 1)
+              font.family: view.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+        }
       }
     }
 
     PanelSeparator { visible: view.dailyRows.length > 0; foreground: view.foreground }
 
-    PanelSectionHeader {
-      visible: view.dailyRows.length > 0
-      text: "THIS WEEK"
-      foreground: view.foreground
-      fontFamily: view.fontFamily
-    }
-
     // ---- Daily rows: day, glyph, low, range bar, high, and the TUI's
-    //      right-hand annotations — rain chance and amount when present,
-    //      wind when it matters.
+    //      right-hand annotations.
     Column {
       visible: view.dailyRows.length > 0
       width: parent.width
@@ -609,100 +832,6 @@ Item {
           fontFamily: view.fontFamily
         }
       }
-    }
-
-    PanelSeparator { foreground: view.foreground }
-
-    PanelSectionHeader {
-      text: "LOCATION"
-      foreground: view.foreground
-      fontFamily: view.fontFamily
-    }
-
-    // ---- Location picker, power-profile style: recents as bordered
-    //      cells, auto-location beside them, a search field to add more.
-    Grid {
-      id: locationGrid
-      width: parent.width
-      columns: 2
-      columnSpacing: Style.space(8)
-      rowSpacing: Style.space(8)
-
-      readonly property real cellWidth: (width - columnSpacing) / 2
-
-      Repeater {
-        model: view.recentLocations
-
-        Button {
-          required property var modelData
-          width: locationGrid.cellWidth
-          text: String(modelData.label || "").split(",").slice(0, 2).join(",")
-          fontSize: Style.font.bodySmall
-          bordered: true
-          leftAlign: true
-          selected: view.payload && view.payload.location === modelData.label
-          foreground: view.foreground
-          fontFamily: view.fontFamily
-          onClicked: view.applyLocation(modelData)
-        }
-      }
-
-      Button {
-        width: locationGrid.cellWidth
-        iconText: "󰆤"
-        text: "Auto (IP)"
-        fontSize: Style.font.bodySmall
-        bordered: true
-        leftAlign: true
-        foreground: view.foreground
-        fontFamily: view.fontFamily
-        onClicked: view.applyAutoLocation()
-      }
-    }
-
-    TextField {
-      id: searchField
-      width: parent.width
-      foreground: view.foreground
-      placeholderText: "Add location… (Enter to search)"
-      onAccepted: view.searchLocations(text)
-    }
-
-    Text {
-      visible: view.locBusy
-      text: "Looking…"
-      color: view.muted
-      font.family: view.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-
-    Column {
-      visible: view.searchResults.length > 0
-      width: parent.width
-      spacing: Style.space(4)
-
-      Repeater {
-        model: view.searchResults
-
-        Button {
-          required property var modelData
-          width: column.width
-          text: modelData.label
-          fontSize: Style.font.bodySmall
-          leftAlign: true
-          foreground: view.foreground
-          fontFamily: view.fontFamily
-          onClicked: view.applyLocation(modelData)
-        }
-      }
-    }
-
-    Text {
-      bottomPadding: Style.space(2)
-      text: view.payload ? (view.payload.location || "") : ""
-      color: view.muted
-      font.family: view.fontFamily
-      font.pixelSize: Style.font.caption
     }
   }
 }

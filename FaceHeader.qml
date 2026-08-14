@@ -16,8 +16,30 @@ Item {
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
 
+  // When set, the title block is a control (the weather face's location
+  // menu): hand cursor, hover accent, and a clicked() signal.
+  property bool interactive: false
+
+  signal clicked()
+
+  readonly property color titleColor: interactive && headerMouse.containsMouse
+    ? Style.hoverStateColor(foreground, Color.accent)
+    : foreground
+
   width: parent ? parent.width : implicitWidth
   implicitHeight: Math.max(leftRow.implicitHeight, bigText.implicitHeight)
+
+  MouseArea {
+    id: headerMouse
+    x: leftRow.x
+    y: leftRow.y
+    width: leftRow.width
+    height: leftRow.height
+    enabled: header.interactive
+    hoverEnabled: enabled
+    cursorShape: Qt.PointingHandCursor
+    onClicked: header.clicked()
+  }
 
   Row {
     id: leftRow
@@ -45,8 +67,8 @@ Item {
       width: Math.max(0, parent.width - x)
 
       Text {
-        text: header.title
-        color: header.foreground
+        text: header.title + (header.interactive ? "  ▾" : "")
+        color: header.titleColor
         font.family: header.fontFamily
         font.pixelSize: Style.font.title
         font.bold: true

@@ -86,6 +86,42 @@ function severityIsUrgent(severity) {
   return s === "severe" || s === "extreme" || s === "warning"
 }
 
+// Alert badge tone, mirroring the TUI: red for severe/extreme, amber for
+// moderate, quiet for the rest.
+function severityTone(severity) {
+  var s = String(severity || "").toLowerCase()
+  if (s === "severe" || s === "extreme" || s === "warning") return "severe"
+  if (s === "moderate") return "moderate"
+  return "minor"
+}
+
+// "2026-08-16T23:00" -> "Sun 11pm" (minutes only when they matter),
+// matching the TUI's alert timeframe style.
+function alertClock(iso, locale) {
+  var t = parseIsoLocal(iso)
+  if (isNaN(t)) return ""
+  var d = new Date(t)
+  var h = d.getHours()
+  var suffix = h < 12 ? "am" : "pm"
+  var display = h % 12
+  if (display === 0) display = 12
+  var mins = d.getMinutes()
+  return locale.dayName(d.getDay(), 1 /* Locale.ShortFormat */) + " "
+    + display + (mins > 0 ? ":" + (mins < 10 ? "0" : "") + mins : "") + suffix
+}
+
+function alertTimeframe(effective, expires, locale) {
+  var from = alertClock(effective, locale)
+  var to = alertClock(expires, locale)
+  if (from !== "" && to !== "") return from + " – " + to
+  return from !== "" ? from : (to !== "" ? "until " + to : "")
+}
+
+// "Fayette, Maine, United States" -> "Fayette, Maine".
+function shortLocation(label) {
+  return String(label || "").split(",").slice(0, 2).join(",").trim()
+}
+
 // Temperature → color, mirroring linecast's own TEMP_COLORS stops
 // (_weather_style.py): the ramp lingers in the cool band and turns over
 // quickly through the warm one, so 72°F is already yellow and 82°F

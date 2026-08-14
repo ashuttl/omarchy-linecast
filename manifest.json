@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ashuttl.linecast",
   "name": "Linecast",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "Andrew Shuttleworth",
   "license": "MIT",
   "description": "Weather, sun, moon, and tide pills from linecast, with an anchored weather panel",
