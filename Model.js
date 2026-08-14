@@ -122,6 +122,44 @@ function tempColor(value, tempUnit) {
   return Qt.rgba(last[1], last[2], last[3], 1)
 }
 
+// "2026-08-14T05:42" (local, second optional) -> epoch ms, NaN if unparsable.
+function parseIsoLocal(iso) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(String(iso || ""))
+  if (!m) return NaN
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+                  Number(m[4]), Number(m[5]), Number(m[6] || 0)).getTime()
+}
+
+// Seconds -> "14h08m", "6h12m", "2m38s", "45s". Compact, linecast-style.
+function fmtDuration(totalSeconds) {
+  var s = Math.round(Math.abs(num(totalSeconds, 0)))
+  var h = Math.floor(s / 3600)
+  var m = Math.floor((s % 3600) / 60)
+  if (h > 0) return h + "h" + (m < 10 ? "0" : "") + m + "m"
+  if (m > 0) return m + "m" + (s % 60 > 0 ? (s % 60) + "s" : "")
+  return (s % 60) + "s"
+}
+
+// Signed duration with linecast's typographic minus: +2m38s / −2m38s.
+function fmtDeltaDuration(totalSeconds) {
+  var v = num(totalSeconds, NaN)
+  if (isNaN(v) || v === 0) return ""
+  return (v > 0 ? "+" : "−") + fmtDuration(v)
+}
+
+// "2026-08-27" or a full ISO stamp -> "Aug 27".
+function shortDate(iso) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""))
+  if (!m) return ""
+  var d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  return Qt.locale().monthName(d.getMonth(), 1 /* Locale.ShortFormat */) + " " + d.getDate()
+}
+
+function secondsUntil(iso, nowMs) {
+  var t = parseIsoLocal(iso)
+  return isNaN(t) ? NaN : (t - nowMs) / 1000
+}
+
 function windLine(current, units) {
   var speed = num(current ? current.wind_speed : NaN, NaN)
   if (isNaN(speed)) return ""

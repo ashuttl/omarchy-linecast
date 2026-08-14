@@ -1,16 +1,14 @@
 import QtQuick
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
-import "Model.js" as Model
 
-// The weather pill's popup: current conditions over an hourly strip and a
-// week of Apple-style temperature range bars, all fed by
-// `linecast weather --json`. Follows the clock plugin's panel composition —
-// hero over detail, small-caps section labels, the shared spacing scale.
+// The linecast popup: one panel, four faces. Whichever pill was clicked
+// picks the section and the anchor, so the popup drops from the weather,
+// sunshine, moon, or tide pill it belongs to. Views own their data
+// (JsonFeed each) and fetch lazily the first time they are shown.
 //
-// BarWidget.qml owns the pills and hands this panel the weather pill to
-// anchor against.
+// BarWidget.qml owns the pills, drives `section`, and re-points
+// `anchorItem` at the matching pill before opening.
 Panel {
   id: root
   moduleName: "ashuttl.linecast"
@@ -25,41 +23,18 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // ---- Data. The payload is refetched on open when stale and on a timer
-  //      while the panel is up; the last good payload survives a failed
-  //      fetch so reopening offline still shows something.
-  property var payload: null
-  property bool fetching: false
-  property double fetchedAtMs: 0
-  readonly property int staleAfterMs: 10 * 60 * 1000
+  property string section: "weather"
 
-  readonly property var current: payload ? payload.current : null
-  readonly property var today: payload ? payload.today : null
-  readonly property var units: payload ? payload.units : null
-  readonly property var alerts: payload && payload.alerts ? payload.alerts : []
-  readonly property var hourColumns: payload ? Model.sampleHours(payload.hourly, 2, 12) : []
-  readonly property var dailyRows: payload && payload.daily ? payload.daily : []
-  readonly property var hourExtent: Model.tempExtent(hourColumns, "temperature")
-  readonly property var weekExtent: Model.tempExtent(dailyRows, "low", "high")
-
-  readonly property color contentForeground: bar ? bar.foreground : Color.foreground
-  readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color mutedForeground: Qt.darker(contentForeground, 1.4)
-
-  readonly property int panelWidth: Style.space(380)
+  readonly property var activeView: section === "sunshine" ? sunshineView
+    : section === "moon" ? moonView
+    : section === "tides" ? tidesView
+    : weatherView
 
   function refresh() {
-    if (fetchProc.running) return
-    root.fetching = true
-    fetchProc.running = true
-  }
-
-  function refreshIfStale() {
-    if (!payload || Date.now() - fetchedAtMs > staleAfterMs) refresh()
+    if (activeView && activeView.refresh) activeView.refresh()
   }
 
   function open() {
-    refreshIfStale()
     root.controller.show()
     // Set after showing, not before: showing hands the popout coordinator
     // over, which closes whichever panel was open, and that close clears
@@ -90,29 +65,6 @@ Panel {
       root.bar.centerHoverRevealSuppressed = value
   }
 
-  Process {
-    id: fetchProc
-    command: ["bash", "-lc", "linecast weather --json 2>/dev/null"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        root.fetching = false
-        var parsed = Model.parsePayload(text)
-        if (parsed) {
-          root.payload = parsed
-          root.fetchedAtMs = Date.now()
-        }
-      }
-    }
-  }
-
-  Timer {
-    interval: root.staleAfterMs
-    running: root.opened
-    repeat: true
-    onTriggered: root.refresh()
-  }
-
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -120,8 +72,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(root.panelWidth)
-    contentHeight: panel.fittedContentHeight(weatherColumn.implicitHeight)
+    contentWidth: panel.fittedContentWidth(root.activeView ? root.activeView.panelWidth : Style.space(360))
+    contentHeight: panel.fittedContentHeight(root.activeView ? root.activeView.implicitHeight : Style.space(200))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -132,384 +84,37 @@ Panel {
         if (t === "r" || t === "R") root.refresh()
       }
 
-      Column {
-        id: weatherColumn
+      WeatherView {
+        id: weatherView
         width: parent.width
-        spacing: Style.space(10)
-
-        // ---- Empty state: first open before linecast answers, or a
-        //      linecast build without --json yet.
-        Text {
-          visible: !root.payload
-          width: parent.width
-          horizontalAlignment: Text.AlignHCenter
-          topPadding: Style.space(24)
-          bottomPadding: Style.space(24)
-          text: root.fetching ? "Fetching weather…" : "No weather data — is linecast ≥ 1.9 installed?"
-          wrapMode: Text.WordWrap
-          color: root.mutedForeground
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.body
-        }
-
-        // ---- Hero: glyph and temperature, condition and place beneath.
-        Column {
-          visible: !!root.current
-          width: parent.width
-          spacing: Style.space(2)
-
-          Row {
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(18)
-
-            Text {
-              anchors.baseline: heroTemp.baseline
-              text: root.current ? (root.current.icon || "") : ""
-              color: root.contentForeground
-              font.family: root.contentFontFamily
-              // Decorative, deliberately outside the Style.font.* scale —
-              // sized to the cap height of the temperature beside it.
-              font.pixelSize: 44
-            }
-
-            Text {
-              id: heroTemp
-              text: root.current ? Model.roundTemp(root.current.temperature) : ""
-              color: root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: 52
-              font.bold: true
-            }
-          }
-
-          Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: {
-              if (!root.current) return ""
-              var line = root.current.condition || ""
-              var feels = Model.num(root.current.feels_like, NaN)
-              var actual = Model.num(root.current.temperature, NaN)
-              if (!isNaN(feels) && !isNaN(actual) && Math.abs(feels - actual) >= 3)
-                line += "  ·  feels " + Model.roundTemp(feels)
-              return line
-            }
-            color: root.contentForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: {
-              var line = root.payload ? (root.payload.location || "") : ""
-              if (root.today) {
-                var hi = Model.roundTemp(root.today.high)
-                var lo = Model.roundTemp(root.today.low)
-                if (hi !== "–" && lo !== "–") line += "  ·  " + lo + " / " + hi
-              }
-              return line
-            }
-            color: root.mutedForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          Text {
-            visible: !!(root.payload && root.payload.summary)
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: Math.min(implicitWidth, weatherColumn.width)
-            topPadding: Style.space(4)
-            horizontalAlignment: Text.AlignHCenter
-            wrapMode: Text.WordWrap
-            text: root.payload ? (root.payload.summary || "") : ""
-            color: root.contentForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-            font.italic: true
-          }
-        }
-
-        // ---- Alerts, when the region has any: urgent-tinted, above the
-        //      forecast so a warning is never below the fold.
-        Repeater {
-          model: root.alerts
-
-          Row {
-            required property var modelData
-            width: weatherColumn.width
-            spacing: Style.space(8)
-
-            Text {
-              text: ""
-              color: Model.severityIsUrgent(modelData.severity) ? (root.bar ? root.bar.urgent : Color.urgent) : root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-            }
-
-            Text {
-              width: parent.width - x
-              text: modelData.event || modelData.headline || ""
-              elide: Text.ElideRight
-              color: Model.severityIsUrgent(modelData.severity) ? (root.bar ? root.bar.urgent : Color.urgent) : root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-            }
-          }
-        }
-
-        PanelSeparator { visible: !!root.payload; foreground: root.contentForeground }
-
-        PanelSectionHeader {
-          visible: root.hourColumns.length > 0
-          text: "NEXT 24 HOURS"
-          foreground: root.contentForeground
-          fontFamily: root.contentFontFamily
-        }
-
-        // ---- Hourly strip: one column per sampled hour, temperature over
-        //      a bar scaled within the strip's own min/max.
-        Row {
-          visible: root.hourColumns.length > 0
-          width: parent.width
-
-          Repeater {
-            model: root.hourColumns
-
-            Column {
-              required property var modelData
-              required property int index
-              width: weatherColumn.width / Math.max(1, root.hourColumns.length)
-              spacing: Style.space(4)
-
-              Text {
-                anchors.horizontalCenter: parent.horizontalCenter
-                text: Model.roundTemp(modelData.temperature)
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Item {
-                anchors.horizontalCenter: parent.horizontalCenter
-                width: Style.space(8)
-                height: Style.space(44)
-
-                // The bar spans the strip's own extent, so its gradient runs
-                // from the color of the strip minimum at the base up to this
-                // hour's own temperature color at the tip.
-                Rectangle {
-                  anchors.bottom: parent.bottom
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  width: parent.width
-                  radius: width / 2
-                  height: Style.space(8)
-                    + Model.extentPos(modelData.temperature, root.hourExtent) * (parent.height - Style.space(8))
-                  id: hourBar
-
-                  readonly property real tipT: Model.num(modelData.temperature, 60)
-                  readonly property real baseT: root.hourExtent.min
-                  readonly property string tUnit: root.units ? root.units.temperature : ""
-
-                  gradient: Gradient {
-                    GradientStop { position: 0.0; color: Model.tempColor(hourBar.tipT, hourBar.tUnit) }
-                    GradientStop { position: 0.5; color: Model.tempColor(hourBar.baseT + (hourBar.tipT - hourBar.baseT) * 0.5, hourBar.tUnit) }
-                    GradientStop { position: 1.0; color: Model.tempColor(hourBar.baseT, hourBar.tUnit) }
-                  }
-                }
-              }
-
-              Text {
-                anchors.horizontalCenter: parent.horizontalCenter
-                text: index === 0 ? "now" : Model.hourLabel(modelData.time)
-                color: root.mutedForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-              }
-            }
-          }
-        }
-
-        PanelSeparator { visible: root.dailyRows.length > 0; foreground: root.contentForeground }
-
-        PanelSectionHeader {
-          visible: root.dailyRows.length > 0
-          text: "THIS WEEK"
-          foreground: root.contentForeground
-          fontFamily: root.contentFontFamily
-        }
-
-        // ---- Daily rows: day, glyph, low, range bar, high. The bar is
-        //      positioned within the whole week's extent so warm and cold
-        //      days read against each other, not just against themselves.
-        Column {
-          visible: root.dailyRows.length > 0
-          width: parent.width
-          spacing: Style.space(6)
-
-          Repeater {
-            model: root.dailyRows
-
-            Item {
-              required property var modelData
-              required property int index
-              width: weatherColumn.width
-              height: Math.max(dayName.implicitHeight, Style.space(16))
-
-              Text {
-                id: dayName
-                anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(58)
-                text: Model.dayLabel(modelData.date, index, Qt.locale())
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-                font.bold: index === 0
-              }
-
-              Text {
-                id: dayIcon
-                anchors.verticalCenter: parent.verticalCenter
-                x: dayName.width
-                width: Style.space(26)
-                text: modelData.icon || ""
-                color: Model.num(modelData.precipitation_probability, 0) >= 40
-                  ? root.contentForeground : root.mutedForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              Text {
-                id: dayLow
-                anchors.verticalCenter: parent.verticalCenter
-                x: dayIcon.x + dayIcon.width
-                width: Style.space(34)
-                horizontalAlignment: Text.AlignRight
-                text: Model.roundTemp(modelData.low)
-                color: root.mutedForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              Item {
-                id: rangeTrack
-                anchors.verticalCenter: parent.verticalCenter
-                x: dayLow.x + dayLow.width + Style.space(10)
-                width: dayHigh.x - Style.space(10) - x
-                height: Style.space(6)
-
-                Rectangle {
-                  anchors.fill: parent
-                  radius: height / 2
-                  color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.15)
-                }
-
-                Rectangle {
-                  x: Model.extentPos(modelData.low, root.weekExtent) * parent.width
-                  width: Math.max(height, (Model.extentPos(modelData.high, root.weekExtent)
-                    - Model.extentPos(modelData.low, root.weekExtent)) * parent.width)
-                  height: parent.height
-                  radius: height / 2
-                  // Stops sample the ramp along the way rather than lerping
-                  // straight from low color to high color — a 51°–78° day
-                  // passes through green and yellow like the TUI, instead of
-                  // a teal-to-orange shortcut across RGB space.
-                  id: rangeFill
-
-                  readonly property real lowT: Model.num(modelData.low, 60)
-                  readonly property real highT: Model.num(modelData.high, 60)
-                  readonly property string tUnit: root.units ? root.units.temperature : ""
-
-                  function rampAt(f) {
-                    return Model.tempColor(rangeFill.lowT + (rangeFill.highT - rangeFill.lowT) * f, rangeFill.tUnit)
-                  }
-
-                  gradient: Gradient {
-                    orientation: Gradient.Horizontal
-                    GradientStop { position: 0.00; color: rangeFill.rampAt(0.00) }
-                    GradientStop { position: 0.25; color: rangeFill.rampAt(0.25) }
-                    GradientStop { position: 0.50; color: rangeFill.rampAt(0.50) }
-                    GradientStop { position: 0.75; color: rangeFill.rampAt(0.75) }
-                    GradientStop { position: 1.00; color: rangeFill.rampAt(1.00) }
-                  }
-                }
-              }
-
-              Text {
-                id: dayHigh
-                anchors.verticalCenter: parent.verticalCenter
-                x: parent.width - width
-                width: Style.space(34)
-                horizontalAlignment: Text.AlignRight
-                text: Model.roundTemp(modelData.high)
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-              }
-            }
-          }
-        }
-
-        PanelSeparator { visible: !!root.current; foreground: root.contentForeground }
-
-        // ---- Footer stats: the numbers worth a glance but not a section.
-        Row {
-          visible: !!root.current
-          anchors.horizontalCenter: parent.horizontalCenter
-          spacing: Style.space(20)
-          bottomPadding: Style.space(4)
-
-          FooterStat {
-            glyph: "󰖝"
-            value: Model.windLine(root.current, root.units)
-          }
-
-          FooterStat {
-            glyph: ""
-            value: root.current && Model.num(root.current.humidity, -1) >= 0
-              ? Math.round(root.current.humidity) + "%" : ""
-          }
-
-          FooterStat {
-            glyph: "󰖜"
-            value: root.today ? Model.clockLabel(root.today.sunrise) : ""
-          }
-
-          FooterStat {
-            glyph: "󰖛"
-            value: root.today ? Model.clockLabel(root.today.sunset) : ""
-          }
-
-          FooterStat {
-            glyph: "AQI"
-            value: root.payload && root.payload.aqi && Model.num(root.payload.aqi.us_aqi, -1) >= 0
-              ? String(Math.round(root.payload.aqi.us_aqi)) : ""
-          }
-        }
+        bar: root.bar
+        visible: root.section === "weather"
+        shown: visible && root.opened
       }
-    }
-  }
 
-  component FooterStat: Row {
-    property string glyph: ""
-    property string value: ""
+      SunshineView {
+        id: sunshineView
+        width: parent.width
+        bar: root.bar
+        visible: root.section === "sunshine"
+        shown: visible && root.opened
+      }
 
-    visible: value !== ""
-    spacing: Style.space(5)
+      MoonView {
+        id: moonView
+        width: parent.width
+        bar: root.bar
+        visible: root.section === "moon"
+        shown: visible && root.opened
+      }
 
-    Text {
-      anchors.verticalCenter: parent.verticalCenter
-      text: glyph
-      color: root.mutedForeground
-      font.family: root.contentFontFamily
-      font.pixelSize: Style.font.caption
-    }
-
-    Text {
-      anchors.verticalCenter: parent.verticalCenter
-      text: value
-      color: root.contentForeground
-      font.family: root.contentFontFamily
-      font.pixelSize: Style.font.caption
+      TidesView {
+        id: tidesView
+        width: parent.width
+        bar: root.bar
+        visible: root.section === "tides"
+        shown: visible && root.opened
+      }
     }
   }
 }
