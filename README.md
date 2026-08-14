@@ -50,7 +50,16 @@ omarchy bar move ashuttl.linecast --section center
 
 ## Settings
 
-Inline in the widget's `shell.json` entry:
+Inline in the widget's `shell.json` entry (hot-reloads on save):
+
+- `pills` (default `["weather", "sunshine", "moon", "tides"]`) — which
+  pills show, in display order. The first entry is the always-visible
+  pill and hosts the popup; the rest slide out on the hover hold.
+  For example, weather and tides only:
+
+  ```json
+  { "id": "ashuttl.linecast", "pills": ["weather", "tides"] }
+  ```
 
 - `weatherRefreshSeconds` (default 600) — weather pill refresh interval.
 

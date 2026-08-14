@@ -3,9 +3,11 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// Linecast bar widget: the weather pill is always visible and hosts the
-// weather popup; sunshine, moon, and tides tuck away and slide out on the
+// Linecast bar widget: the first configured pill is always visible and
+// hosts the popup; the remaining pills tuck away and slide out on the
 // bar's center-section reveal hold, same as the stock indicators widget.
+// Which pills show (and their order) comes from the `pills` array on the
+// widget's shell.json entry, defaulting to all four.
 //
 // Pills read the scripts/ helpers (Waybar-style JSON from linecast's
 // --oneline output). Left click on weather opens the anchored panel;
@@ -22,29 +24,66 @@ BarWidget {
   }
   readonly property string scriptsDir: pluginDir + "scripts"
 
+  // Pill roster, same shape as the stock indicators widget's `items`
+  // setting: the shell.json entry may carry `pills: ["weather", "tides"]`
+  // to pick which pills show and in what order. Unknown names and dupes
+  // are dropped; an empty or missing setting means all four.
+  readonly property var knownPills: ["weather", "sunshine", "moon", "tides"]
+  readonly property var pillOrder: {
+    var requested = root.setting("pills", knownPills)
+    var result = []
+    var count = requested && typeof requested.length === "number" ? requested.length : 0
+    for (var i = 0; i < count; i++) {
+      var name = String(requested[i])
+      if (knownPills.indexOf(name) !== -1 && result.indexOf(name) === -1) result.push(name)
+    }
+    return result.length > 0 ? result : knownPills
+  }
+
+  function sectionEnabled(section) {
+    return pillOrder.indexOf(section) !== -1
+  }
+
+  function refreshSecondsFor(name) {
+    if (name === "weather") return root.setting("weatherRefreshSeconds", 600)
+    if (name === "sunshine") return 60
+    return 300
+  }
+
   readonly property bool revealExtras: bar
     && ((bar.centerSectionRevealHeld === true
          && bar.centerHoverRevealSuppressed !== true)
-        // An open sunshine/moon/tides panel is anchored to its pill, so the
-        // extras must stay out while it is up — hover has moved to the
-        // panel by then and the reveal hold alone would let them collapse.
-        || (root.opened && root.activeSection !== "weather"))
+        // An open extras panel is anchored to its pill, so the extras
+        // must stay out while it is up — hover has moved to the panel
+        // by then and the reveal hold alone would let them collapse.
+        || (root.opened && root.activeSection !== root.pillOrder[0]))
 
   // The section the panel is showing (or last showed): pill clicks set it,
   // and the extras hold-open and panel indicator follow it.
-  property string activeSection: "weather"
+  property string activeSection: pillOrder[0]
+
+  // A settings edit can drop the pill the panel last showed; fall back to
+  // the anchor pill so the section never points at a pill that isn't there.
+  onPillOrderChanged: {
+    if (!sectionEnabled(activeSection)) setSection(pillOrder[0])
+  }
 
   function pillFor(section) {
-    if (section === "sunshine") return sunshinePill
-    if (section === "moon") return moonPill
-    if (section === "tides") return tidesPill
-    return weatherPill
+    for (var i = 0; i < anchorRepeater.count; i++) {
+      var a = anchorRepeater.itemAt(i)
+      if (a && a.pillName === section) return a
+    }
+    for (var j = 0; j < extrasRepeater.count; j++) {
+      var e = extrasRepeater.itemAt(j)
+      if (e && e.pillName === section) return e
+    }
+    return anchorRepeater.count > 0 ? anchorRepeater.itemAt(0) : null
   }
 
   function setSection(section) {
+    root.activeSection = section
     var p = panelLoader.item
     if (!p) return
-    root.activeSection = section
     p.section = section
     p.anchorItem = pillFor(section)
   }
@@ -66,6 +105,7 @@ BarWidget {
   // the bar's summon path pick the surface to open on — same routing
   // shell.summon uses.
   function openSectionFromIpc(section) {
+    if (!sectionEnabled(section)) section = pillOrder[0]
     var items = bar && typeof bar.moduleWidgets === "function"
       ? bar.moduleWidgets(moduleName) : [root]
     for (var i = 0; i < items.length; i++) {
@@ -76,7 +116,8 @@ BarWidget {
   }
 
   function refresh() {
-    weatherPill.rerun()
+    for (var i = 0; i < anchorRepeater.count; i++) anchorRepeater.itemAt(i).rerun()
+    for (var j = 0; j < extrasRepeater.count; j++) extrasRepeater.itemAt(j).rerun()
     if (panelLoader.item && panelLoader.item.refresh) panelLoader.item.refresh()
   }
 
@@ -157,10 +198,17 @@ BarWidget {
     anchors.verticalCenter: parent.verticalCenter
     spacing: 0
 
-    LinecastPill {
-      id: weatherPill
-      pillName: "weather"
-      refreshSeconds: root.setting("weatherRefreshSeconds", 600)
+    Repeater {
+      id: anchorRepeater
+      model: root.pillOrder.slice(0, 1)
+
+      // pillName is required, which turns off the delegate's implicit
+      // modelData context — declare it required so the Repeater injects it.
+      LinecastPill {
+        required property var modelData
+        pillName: modelData
+        refreshSeconds: root.refreshSecondsFor(modelData)
+      }
     }
 
     Item {
@@ -178,9 +226,16 @@ BarWidget {
         anchors.verticalCenter: parent.verticalCenter
         spacing: 0
 
-        LinecastPill { id: sunshinePill; pillName: "sunshine"; refreshSeconds: 60 }
-        LinecastPill { id: moonPill; pillName: "moon"; refreshSeconds: 300 }
-        LinecastPill { id: tidesPill; pillName: "tides"; refreshSeconds: 300 }
+        Repeater {
+          id: extrasRepeater
+          model: root.pillOrder.slice(1)
+
+          LinecastPill {
+            required property var modelData
+            pillName: modelData
+            refreshSeconds: root.refreshSecondsFor(modelData)
+          }
+        }
       }
     }
   }
