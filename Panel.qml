@@ -213,6 +213,20 @@ Panel {
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption
           }
+
+          Text {
+            visible: !!(root.payload && root.payload.summary)
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(implicitWidth, weatherColumn.width)
+            topPadding: Style.space(4)
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            text: root.payload ? (root.payload.summary || "") : ""
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+            font.italic: true
+          }
         }
 
         // ---- Alerts, when the region has any: urgent-tinted, above the
@@ -280,6 +294,9 @@ Panel {
                 width: Style.space(8)
                 height: Style.space(44)
 
+                // The bar spans the strip's own extent, so its gradient runs
+                // from the color of the strip minimum at the base up to this
+                // hour's own temperature color at the tip.
                 Rectangle {
                   anchors.bottom: parent.bottom
                   anchors.horizontalCenter: parent.horizontalCenter
@@ -287,9 +304,16 @@ Panel {
                   radius: width / 2
                   height: Style.space(8)
                     + Model.extentPos(modelData.temperature, root.hourExtent) * (parent.height - Style.space(8))
-                  color: Model.num(modelData.precipitation_probability, 0) >= 40
-                    ? root.mutedForeground
-                    : Color.accent
+                  gradient: Gradient {
+                    GradientStop {
+                      position: 0
+                      color: Model.tempColor(modelData.temperature, root.units ? root.units.temperature : "")
+                    }
+                    GradientStop {
+                      position: 1
+                      color: Model.tempColor(root.hourExtent.min, root.units ? root.units.temperature : "")
+                    }
+                  }
                 }
               }
 
@@ -384,7 +408,17 @@ Panel {
                     - Model.extentPos(modelData.low, root.weekExtent)) * parent.width)
                   height: parent.height
                   radius: height / 2
-                  color: Color.accent
+                  gradient: Gradient {
+                    orientation: Gradient.Horizontal
+                    GradientStop {
+                      position: 0
+                      color: Model.tempColor(modelData.low, root.units ? root.units.temperature : "")
+                    }
+                    GradientStop {
+                      position: 1
+                      color: Model.tempColor(modelData.high, root.units ? root.units.temperature : "")
+                    }
+                  }
                 }
               }
 

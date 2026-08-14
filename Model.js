@@ -86,6 +86,22 @@ function severityIsUrgent(severity) {
   return s === "severe" || s === "extreme" || s === "warning"
 }
 
+// Temperature → color, Apple-Weather-style: indigo through teal, green,
+// yellow, orange to red across the livable range. Hue is interpolated in
+// °F regardless of display units so both scales get the same ramp;
+// saturation/lightness are fixed for legibility on the panel background.
+function tempHue(value, tempUnit) {
+  var t = num(value, 60)
+  if (String(tempUnit || "").indexOf("C") >= 0) t = t * 9 / 5 + 32
+  var clamped = Math.min(100, Math.max(5, t))
+  // 5°F → 250 (indigo), ~55°F → ~120 (green), 100°F → 0 (red)
+  return 250 * (1 - (clamped - 5) / 95)
+}
+
+function tempColor(value, tempUnit) {
+  return Qt.hsla(tempHue(value, tempUnit) / 360, 0.6, 0.6, 1)
+}
+
 function windLine(current, units) {
   var speed = num(current ? current.wind_speed : NaN, NaN)
   if (isNaN(speed)) return ""
