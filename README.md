@@ -1,4 +1,4 @@
-# Linecast for Omarchy
+# omarchy-linecast
 
 An [Omarchy](https://omarchy.org) bar-widget plugin for
 [linecast](https://github.com/ashuttl/linecast) — terminal weather, solar
@@ -39,7 +39,7 @@ arc, moon, and tides.
 ## Install
 
 ```bash
-omarchy plugin add <this-repo-url> --enable
+omarchy plugin add https://github.com/ashuttl/omarchy-linecast.git --enable
 ```
 
 Then add the widget to the bar if it wasn't added automatically:
