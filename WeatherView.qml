@@ -370,7 +370,7 @@ Item {
 
     PanelSeparator { visible: view.hourly.length > 2; foreground: view.foreground }
 
-    // ---- The hourly chart: 24 hours in view, the whole forecast on
+    // ---- The hourly chart: 48 hours in view, the whole forecast on
     //      scroll, a chip on hover. Type sits on the body scale so the
     //      chart reads as part of the panel, not a miniature of it.
     Flickable {
@@ -386,13 +386,24 @@ Item {
       Canvas {
         id: hourlyChart
 
-        readonly property real capF: Style.font.caption
-        readonly property real hourW: column.width / 24
+        // One type size across the panel: chart labels match the daily
+        // rows and the info grid below.
+        readonly property real capF: Style.font.bodySmall
+        readonly property real hourW: column.width / 48
         readonly property real plotTop: capF + 12
-        readonly property real plotBottom: plotTop + 76
+        readonly property real plotBottom: plotTop + 148
         readonly property real axisY: plotBottom + capF + 6
-        readonly property real annoY1: axisY + capF + 5
-        readonly property real annoY2: annoY1 + capF + 4
+        // The UV and wind rows only reserve height when they'll draw
+        // something, so a quiet forecast doesn't leave a blank band
+        // between the chart and the daily table.
+        readonly property bool hasUv: view.hourly.some(function(h) {
+          return Model.num(h.uv_index, 0) >= 6
+        })
+        readonly property bool hasWind: view.hourly.some(function(h, i) {
+          return i % 3 === 0 && Model.windSignificant(Model.num(h.wind_speed, 0), view.windUnit)
+        })
+        readonly property real annoY1: axisY + (hasUv ? capF + 5 : 0)
+        readonly property real annoY2: annoY1 + (hasWind ? capF + 4 : 0)
 
         readonly property int hoverIndex: chartMouse.containsMouse
           ? Math.max(0, Math.min(view.hourly.length - 1, Math.floor(chartMouse.mouseX / hourW)))
@@ -403,6 +414,7 @@ Item {
         height: annoY2 + 4
 
         onWidthChanged: requestPaint()
+        onHeightChanged: requestPaint()
 
         onPaint: {
           var ctx = getContext("2d")
@@ -470,7 +482,7 @@ Item {
             if (prob < 15) continue
             var pc = Model.precipColorFor(hours[p].weather_code, view.foreground, view.themeColors)
             ctx.fillStyle = Qt.rgba(pc.r, pc.g, pc.b, 0.4)
-            var ph = prob / 100 * 26
+            var ph = prob / 100 * 50
             ctx.fillRect(p * hourW + hourW * 0.2, plotBottom - ph, hourW * 0.6, ph)
           }
 
@@ -565,13 +577,15 @@ Item {
           color: Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.3)
         }
 
-        // The chip, TUI style: time, temperature (feels), condition.
+        // The chip, TUI style: time, temperature (feels), condition. It
+        // anchors to the hovered hour's column — data is hourly, so the
+        // chip steps hour to hour rather than trailing the pointer.
         Rectangle {
           id: hoverChip
           visible: hourlyChart.hoverHour !== null
           x: Math.max(hourlyFlick.contentX + 4,
              Math.min(hourlyFlick.contentX + hourlyFlick.width - width - 4,
-                      chartMouse.mouseX + Style.space(14)))
+                      (hourlyChart.hoverIndex + 0.5) * hourlyChart.hourW + Style.space(14)))
           y: hourlyChart.plotTop
           width: chipColumn.implicitWidth + Style.space(16)
           height: chipColumn.implicitHeight + Style.space(12)
@@ -675,7 +689,7 @@ Item {
             text: Model.dayLabel(modelData.date, index, Qt.locale())
             color: view.foreground
             font.family: view.fontFamily
-            font.pixelSize: Style.font.body
+            font.pixelSize: Style.font.bodySmall
             font.bold: index === 0
           }
 
@@ -687,44 +701,48 @@ Item {
             text: modelData.icon || ""
             color: dayRow.prob >= 40 ? view.foreground : view.muted
             font.family: view.fontFamily
-            font.pixelSize: Style.font.body
-          }
-
-          Text {
-            id: dayLow
-            anchors.verticalCenter: parent.verticalCenter
-            x: dayIcon.x + dayIcon.width
-            width: Style.space(30)
-            horizontalAlignment: Text.AlignRight
-            text: Model.roundTemp(modelData.low)
-            color: view.muted
-            font.family: view.fontFamily
-            font.pixelSize: Style.font.body
+            font.pixelSize: Style.font.bodySmall
           }
 
           Item {
-            id: rangeTrack
+            id: rangeArea
             anchors.verticalCenter: parent.verticalCenter
-            x: dayLow.x + dayLow.width + Style.space(10)
-            width: dayHigh.x - Style.space(10) - x
-            height: Style.space(6)
+            x: dayIcon.x + dayIcon.width
+            // The right edge is fixed across rows so every bar shares the
+            // week axis; only the annotations vary in width.
+            width: parent.width - Style.space(72) - x
+            height: parent.height
 
-            Rectangle {
-              anchors.fill: parent
-              radius: height / 2
-              color: Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.15)
+            // Low/high ride the ends of each day's bar like the TUI, so
+            // the numbers trace the week's shape instead of sitting in
+            // columns. The insets keep a label's worth of room beyond the
+            // week's extremes.
+            readonly property real inset: Style.space(34)
+            readonly property real fillX: inset
+              + Model.extentPos(dayRow.modelData.low, view.weekExtent) * (width - 2 * inset)
+            readonly property real fillW: Math.max(Style.space(6),
+              (Model.extentPos(dayRow.modelData.high, view.weekExtent)
+               - Model.extentPos(dayRow.modelData.low, view.weekExtent)) * (width - 2 * inset))
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              x: rangeArea.fillX - width - Style.space(6)
+              text: Model.roundTemp(dayRow.modelData.low)
+              color: view.muted
+              font.family: view.fontFamily
+              font.pixelSize: Style.font.bodySmall
             }
 
             Rectangle {
               id: rangeFill
-              x: Model.extentPos(modelData.low, view.weekExtent) * parent.width
-              width: Math.max(height, (Model.extentPos(modelData.high, view.weekExtent)
-                - Model.extentPos(modelData.low, view.weekExtent)) * parent.width)
-              height: parent.height
+              anchors.verticalCenter: parent.verticalCenter
+              x: rangeArea.fillX
+              width: rangeArea.fillW
+              height: Style.space(6)
               radius: height / 2
 
-              readonly property real lowT: Model.num(modelData.low, 60)
-              readonly property real highT: Model.num(modelData.high, 60)
+              readonly property real lowT: Model.num(dayRow.modelData.low, 60)
+              readonly property real highT: Model.num(dayRow.modelData.high, 60)
 
               // Stops sample the ramp along the way rather than lerping
               // endpoint colors straight across RGB space.
@@ -742,24 +760,21 @@ Item {
                 GradientStop { position: 1.00; color: rangeFill.rampAt(1.00) }
               }
             }
-          }
 
-          Text {
-            id: dayHigh
-            anchors.verticalCenter: parent.verticalCenter
-            x: annoCol.x - width - Style.space(4)
-            width: Style.space(30)
-            horizontalAlignment: Text.AlignRight
-            text: Model.roundTemp(modelData.high)
-            color: view.foreground
-            font.family: view.fontFamily
-            font.pixelSize: Style.font.body
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              x: rangeArea.fillX + rangeArea.fillW + Style.space(6)
+              text: Model.roundTemp(dayRow.modelData.high)
+              color: view.foreground
+              font.family: view.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
           }
 
           Row {
             id: annoCol
             anchors.verticalCenter: parent.verticalCenter
-            x: parent.width - Style.space(64)
+            anchors.right: parent.right
             spacing: Style.space(6)
 
             Text {
@@ -770,7 +785,7 @@ Item {
                 return Qt.rgba(pc.r, pc.g, pc.b, 1)
               }
               font.family: view.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.bodySmall
             }
 
             Text {
@@ -778,7 +793,7 @@ Item {
               visible: text !== ""
               color: view.muted
               font.family: view.fontFamily
-              font.pixelSize: Style.font.caption
+              font.pixelSize: Style.font.bodySmall
             }
           }
         }
