@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ashuttl.linecast",
   "name": "Linecast",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": "Andrew Shuttleworth",
   "license": "MIT",
-  "description": "Weather, sun, moon, and tide pills from linecast, with an anchored weather panel",
+  "description": "Weather, sun, moon, and tide pills from linecast, each with an anchored panel",
   "kinds": [
     "bar-widget"
   ],
@@ -14,8 +14,48 @@
   },
   "barWidget": {
     "displayName": "Linecast",
-    "description": "Weather pill with hover-reveal sun/moon/tide pills and a weather popup",
+    "description": "Weather, sunshine, moon, and tide pills with anchored panels — add one widget per pill to spread them around the bar",
     "category": "Weather",
-    "allowMultiple": false
+    "allowMultiple": true,
+    "schema": [
+      {
+        "key": "pills",
+        "type": "multiselect",
+        "label": "Pills",
+        "description": "Which pills this widget shows, in order. The first is always visible and the rest slide out on hover. Leave empty to show all four.",
+        "noSelectionText": "All pills",
+        "placeholderText": "Search pills...",
+        "emptyText": "No pills",
+        "options": [
+          {
+            "value": "weather",
+            "label": "Weather",
+            "description": "Conditions and temperature"
+          },
+          {
+            "value": "sunshine",
+            "label": "Sunshine",
+            "description": "Solar arc and day length"
+          },
+          {
+            "value": "moon",
+            "label": "Moon",
+            "description": "Phase and illumination"
+          },
+          {
+            "value": "tides",
+            "label": "Tides",
+            "description": "Next high or low water"
+          }
+        ]
+      },
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Always Show",
+        "description": "Keep every pill out instead of sliding the extras in on hover.",
+        "defaultValue": false
+      }
+    ]
   }
 }

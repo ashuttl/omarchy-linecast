@@ -42,19 +42,13 @@ Panel {
     if (activeView && activeView.refresh) activeView.refresh()
   }
 
-  // Same write-back path as the stock panels: applied locally first so the
-  // panel reacts on the click, then persisted through the bar into the
-  // widget's shell.json entry.
-  function persistSettings(values) {
-    var entry = { id: root.moduleName }
-    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
-    for (var key in values) entry[key] = values[key]
-
-    root.settings = entry
-    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
-      root.bar.shell.updateEntryInline(root.moduleName, entry)
-  }
+  // No write-back into shell.json. The stock panels persist through
+  // shell.updateEntryInline, which keys on the plugin id and so writes the
+  // same settings object onto every layout entry carrying it — fine for a
+  // single-instance widget, destructive here, where each Linecast entry
+  // holds its own `pills`. The one thing a panel wants to save is the
+  // location picker's recents, and those are shared state that belongs in a
+  // file: see RecentLocations.qml.
 
   function open() {
     root.controller.show()

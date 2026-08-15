@@ -46,7 +46,7 @@ Item {
   readonly property string windUnit: units ? units.wind : ""
   readonly property string precipUnit: units ? units.precipitation : ""
 
-  readonly property var recentLocations: host ? host.setting("recentLocations", []) : []
+  readonly property var recentLocations: recents.entries
 
   property bool locMenuOpen: false
 
@@ -123,14 +123,14 @@ Item {
     })
   }
 
+  // Shared across every Linecast widget on the bar, and across restarts.
+  RecentLocations {
+    id: recents
+    legacyEntries: view.host ? view.host.setting("recentLocations", []) : []
+  }
+
   function rememberLocation(entry) {
-    var next = [entry]
-    for (var i = 0; i < view.recentLocations.length && next.length < 10; i++) {
-      var r = view.recentLocations[i]
-      if (r && r.label !== entry.label) next.push(r)
-    }
-    if (view.host && typeof view.host.persistSettings === "function")
-      view.host.persistSettings({ recentLocations: next })
+    recents.remember(entry)
   }
 
   function applyLocation(entry) {

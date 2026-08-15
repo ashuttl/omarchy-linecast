@@ -4,10 +4,17 @@ import qs.Commons
 import qs.Ui
 
 // Linecast bar widget: the first configured pill is always visible and
-// hosts the popup; the remaining pills tuck away and slide out on the
-// bar's center-section reveal hold, same as the stock indicators widget.
-// Which pills show (and their order) comes from the `pills` array on the
-// widget's shell.json entry, defaulting to all four.
+// hosts the popup; the remaining pills tuck away and slide out on hover,
+// same as the stock indicators widget. Which pills show (and their order)
+// comes from the `pills` array on the widget's shell.json entry, defaulting
+// to all four.
+//
+// The manifest allows multiple instances, so the four pills do not have to
+// travel together: one entry per pill puts weather in the center and tides
+// over on the right, each with its own panel anchored under it. Every
+// instance is independent apart from the location, which is linecast's own
+// global setting, and the picker's recents, which live in a shared file
+// (see RecentLocations.qml).
 //
 // Pills read the scripts/ helpers (Waybar-style JSON from linecast's
 // --oneline output). Left click on weather opens the anchored panel;
@@ -50,13 +57,45 @@ BarWidget {
     return 300
   }
 
-  readonly property bool revealExtras: bar
-    && ((bar.centerSectionRevealHeld === true
-         && bar.centerHoverRevealSuppressed !== true)
-        // An open extras panel is anchored to its pill, so the extras
-        // must stay out while it is up — hover has moved to the panel
-        // by then and the reveal hold alone would let them collapse.
-        || (root.opened && root.activeSection !== root.pillOrder[0]))
+  readonly property bool alwaysShow: root.setting("alwaysShow", false) === true
+
+  readonly property bool revealExtras: root.alwaysShow
+    || root.pillsHovered
+    || (bar && bar.centerSectionRevealHeld === true
+        && bar.centerHoverRevealSuppressed !== true)
+    // An open extras panel is anchored to its pill, so the extras
+    // must stay out while it is up — hover has moved to the panel
+    // by then and the reveal hold alone would let them collapse.
+    || (root.opened && root.activeSection !== root.pillOrder[0])
+
+  // Reveal on our own hover as well as the bar's reveal hold. The hold is a
+  // center-section gesture, so a widget parked in left or right never sees
+  // it and would keep its extras tucked away forever. In the center this
+  // adds nothing: pointing at the pills already means pointing at the
+  // section that raises the hold.
+  property bool pillsHovered: false
+
+  function setPillsHovered(hovered) {
+    if (hovered) {
+      pillsCollapseTimer.stop()
+      root.pillsHovered = true
+    } else {
+      // Collapse on a delay, the way the bar holds its own reveal: sliding
+      // the extras out moves the neighbours, and a pointer that lands in the
+      // seam for a frame should not snap them shut.
+      pillsCollapseTimer.restart()
+    }
+  }
+
+  Timer {
+    id: pillsCollapseTimer
+    interval: 120
+    onTriggered: root.pillsHovered = false
+  }
+
+  HoverHandler {
+    onHoveredChanged: root.setPillsHovered(hovered)
+  }
 
   // The section the panel is showing (or last showed): pill clicks set it,
   // and the extras hold-open and panel indicator follow it.
@@ -99,20 +138,71 @@ BarWidget {
     p.open()
   }
 
-  // The IPC route: a per-target handler only reaches whichever per-monitor
-  // instance claimed the target (which may be the zero-size placeholder for
-  // anchored center modules), so set the section on every instance and let
-  // the bar's summon path pick the surface to open on — same routing
-  // shell.summon uses.
+  // The IPC route. A per-target handler only reaches whichever widget claimed
+  // the target, and that is rarely the one the caller means: bar surfaces are
+  // built per monitor, and with the pills split across several entries the
+  // widget carrying `tides` may not be the one holding the handler. So the
+  // claimant resolves the request itself — point every copy that carries the
+  // pill at it, then open the copy the bar would have summoned.
+  //
+  // bar.summonBarWidget can't do the picking for us: it resolves by plugin
+  // id, which no longer identifies one widget.
   function openSectionFromIpc(section) {
-    if (!sectionEnabled(section)) section = pillOrder[0]
-    var items = bar && typeof bar.moduleWidgets === "function"
-      ? bar.moduleWidgets(moduleName) : [root]
-    for (var i = 0; i < items.length; i++) {
-      if (items[i] && typeof items[i].setSection === "function") items[i].setSection(section)
+    var name = String(section || "")
+    var slots = bar && bar.moduleSlots ? bar.moduleSlots : []
+    var owners = []
+    for (var i = 0; i < slots.length; i++) {
+      var slot = slots[i]
+      if (!slot || !slot.activeItem || slot.moduleName !== root.moduleName) continue
+      var item = slot.activeItem
+      if (typeof item.sectionEnabled !== "function" || !item.sectionEnabled(name)) continue
+      item.setSection(name)
+      owners.push(slot)
     }
-    if (bar && typeof bar.summonBarWidget === "function") bar.summonBarWidget(moduleName)
-    else openSection(section)
+    // No widget on the bar carries this pill (or we have no bar to ask):
+    // fall back to our own anchor pill rather than doing nothing.
+    if (owners.length === 0) {
+      openSection(sectionEnabled(name) ? name : pillOrder[0])
+      return
+    }
+    var target = pickOwnerSlot(owners)
+    if (target && target.activeItem) target.activeItem.open()
+  }
+
+  // The same narrowing Bar.findPanelWidget applies, restricted to the slots
+  // that carry the pill we were asked for. An already-open copy wins, so
+  // a repeat call reaches the panel the user can see; otherwise the focused
+  // monitor's copy does. Anchored center modules leave a zero-size
+  // placeholder slot behind, so prefer one that is actually drawn.
+  function pickOwnerSlot(slots) {
+    var pool = slots.filter(function(slot) { return slot.activeItem.opened === true })
+    if (pool.length === 0) pool = slots
+
+    var focused = bar && typeof bar.focusedScreenName === "function" ? bar.focusedScreenName() : ""
+    if (focused && typeof bar.slotScreenName === "function") {
+      var onFocused = pool.filter(function(slot) { return bar.slotScreenName(slot) === focused })
+      if (onFocused.length > 0) pool = onFocused
+    }
+
+    for (var i = 0; i < pool.length; i++) {
+      if (pool[i].visible === true && pool[i].width > 0 && pool[i].height > 0) return pool[i]
+    }
+    return pool.length > 0 ? pool[0] : null
+  }
+
+  // open/close/toggle name no pill, so they act on the Linecast widget the
+  // bar would route a hotkey to rather than on whichever copy happens to
+  // hold the IPC target.
+  function ipcPanelWidget() {
+    var slots = bar && bar.moduleSlots ? bar.moduleSlots : []
+    var mine = []
+    for (var i = 0; i < slots.length; i++) {
+      var slot = slots[i]
+      if (slot && slot.activeItem && slot.moduleName === root.moduleName) mine.push(slot)
+    }
+    if (mine.length === 0) return root
+    var target = pickOwnerSlot(mine)
+    return target && target.activeItem ? target.activeItem : root
   }
 
   function refresh() {
@@ -185,11 +275,11 @@ BarWidget {
     target: "ashuttl.linecast"
 
     function refresh(): void { root.broadcast("refresh") }
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.togglePanel() }
+    function open(): void { root.ipcPanelWidget().open() }
+    function close(): void { root.ipcPanelWidget().close() }
+    function show(): void { root.ipcPanelWidget().open() }
+    function hide(): void { root.ipcPanelWidget().close() }
+    function toggle(): void { root.ipcPanelWidget().togglePanel() }
     function openSection(name: string): void { root.openSectionFromIpc(name) }
   }
 
