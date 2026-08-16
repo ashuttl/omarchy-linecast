@@ -6,23 +6,36 @@ import qs.Ui
 // Linecast bar widget: the first configured pill is always visible and
 // hosts the popup; the remaining pills tuck away and slide out on hover,
 // same as the stock indicators widget. Which pills show (and their order)
-// comes from the `pills` array on the widget's shell.json entry, defaulting
-// to all four.
+// comes from the `pills` array on the widget's shell.json entry.
 //
-// The manifest allows multiple instances, so the four pills do not have to
-// travel together: one entry per pill puts weather in the center and tides
-// over on the right, each with its own panel anchored under it. Every
-// instance is independent apart from the location, which is linecast's own
-// global setting, and the picker's recents, which live in a shared file
-// (see RecentLocations.qml).
+// This is also the base the companion plugins are built from — the tide
+// pill as its own bar widget is this component with `defaultPills:
+// ["tides"]` and a manifest of its own. They need separate plugin ids
+// rather than several entries of one id because Omarchy identifies a bar
+// widget by that id alone: the drag-and-drop reorder resolves the dragged
+// widget with a first-match-by-id lookup (Bar.moveModuleInConfig), so with
+// duplicate ids it moves whichever entry comes first rather than the one
+// under the pointer. Same for `omarchy bar move/set`.
+//
+// The companions load this file from ../ashuttl.linecast, so Qt.resolvedUrl
+// here still points at this directory: they share the one copy of the
+// scripts, the panel, and the views, and only bring their own identity.
 //
 // Pills read the scripts/ helpers (Waybar-style JSON from linecast's
-// --oneline output). Left click on weather opens the anchored panel;
-// right click on weather and any click on the extras toggle floating
-// linecast TUI terminals.
+// --oneline output). Left click on a pill opens its anchored panel;
+// right click floats the full linecast TUI.
 BarWidget {
   id: root
-  moduleName: "ashuttl.linecast"
+
+  // moduleName is injected by the bar from the layout entry's id, which is
+  // what tells this widget apart from its companions. Everything identity
+  // shaped hangs off it — the IPC target, the slot lookups — so nothing
+  // here hardcodes the plugin id.
+
+  // Marks the whole family for cross-plugin routing: `openSection` and
+  // `refresh` reach the tide widget from the weather widget's IPC target,
+  // whichever plugin each of them came from.
+  readonly property bool linecastWidget: true
 
   // Absolute path of this plugin's directory, for Process commands.
   readonly property string pluginDir: {
@@ -34,17 +47,19 @@ BarWidget {
   // Pill roster, same shape as the stock indicators widget's `items`
   // setting: the shell.json entry may carry `pills: ["weather", "tides"]`
   // to pick which pills show and in what order. Unknown names and dupes
-  // are dropped; an empty or missing setting means all four.
+  // are dropped; an empty or missing setting means defaultPills, which the
+  // companion plugins narrow to their own single pill.
   readonly property var knownPills: ["weather", "sunshine", "moon", "tides"]
+  property var defaultPills: knownPills
   readonly property var pillOrder: {
-    var requested = root.setting("pills", knownPills)
+    var requested = root.setting("pills", defaultPills)
     var result = []
     var count = requested && typeof requested.length === "number" ? requested.length : 0
     for (var i = 0; i < count; i++) {
       var name = String(requested[i])
       if (knownPills.indexOf(name) !== -1 && result.indexOf(name) === -1) result.push(name)
     }
-    return result.length > 0 ? result : knownPills
+    return result.length > 0 ? result : defaultPills
   }
 
   function sectionEnabled(section) {
@@ -138,26 +153,37 @@ BarWidget {
     p.open()
   }
 
-  // The IPC route. A per-target handler only reaches whichever widget claimed
-  // the target, and that is rarely the one the caller means: bar surfaces are
-  // built per monitor, and with the pills split across several entries the
-  // widget carrying `tides` may not be the one holding the handler. So the
-  // claimant resolves the request itself — point every copy that carries the
-  // pill at it, then open the copy the bar would have summoned.
-  //
-  // bar.summonBarWidget can't do the picking for us: it resolves by plugin
-  // id, which no longer identifies one widget.
-  function openSectionFromIpc(section) {
-    var name = String(section || "")
+  // Every Linecast widget on the bar, whichever plugin shipped it, so a
+  // request can cross from one companion to another. A bar surface is built
+  // per monitor, so each widget appears here once per screen.
+  function familySlots(sameModuleOnly) {
     var slots = bar && bar.moduleSlots ? bar.moduleSlots : []
-    var owners = []
+    var found = []
     for (var i = 0; i < slots.length; i++) {
       var slot = slots[i]
-      if (!slot || !slot.activeItem || slot.moduleName !== root.moduleName) continue
-      var item = slot.activeItem
+      if (!slot || !slot.activeItem || slot.activeItem.linecastWidget !== true) continue
+      if (sameModuleOnly && slot.moduleName !== root.moduleName) continue
+      found.push(slot)
+    }
+    return found
+  }
+
+  // The IPC route, and the reason `openSection tides` still works when tides
+  // is a separate plugin: the widget that owns the pill may not be the one
+  // holding the target the call came in on. So point every copy carrying the
+  // pill at it, then open the copy the bar would have summoned.
+  //
+  // bar.summonBarWidget can't do the picking for us — it resolves by plugin
+  // id, and the pill we were handed is what identifies the widget here.
+  function openSectionFromIpc(section) {
+    var name = String(section || "")
+    var slots = familySlots(false)
+    var owners = []
+    for (var i = 0; i < slots.length; i++) {
+      var item = slots[i].activeItem
       if (typeof item.sectionEnabled !== "function" || !item.sectionEnabled(name)) continue
       item.setSection(name)
-      owners.push(slot)
+      owners.push(slots[i])
     }
     // No widget on the bar carries this pill (or we have no bar to ask):
     // fall back to our own anchor pill rather than doing nothing.
@@ -167,6 +193,21 @@ BarWidget {
     }
     var target = pickOwnerSlot(owners)
     if (target && target.activeItem) target.activeItem.open()
+  }
+
+  // `refresh` is about the data behind the pills, which every Linecast widget
+  // shares, so it reaches the whole family rather than stopping at this
+  // plugin's own copies.
+  function refreshFamily() {
+    var slots = familySlots(false)
+    var seen = []
+    for (var i = 0; i < slots.length; i++) {
+      var item = slots[i].activeItem
+      if (seen.indexOf(item) !== -1 || typeof item.refresh !== "function") continue
+      seen.push(item)
+      item.refresh()
+    }
+    if (seen.indexOf(root) === -1) root.refresh()
   }
 
   // The same narrowing Bar.findPanelWidget applies, restricted to the slots
@@ -190,16 +231,11 @@ BarWidget {
     return pool.length > 0 ? pool[0] : null
   }
 
-  // open/close/toggle name no pill, so they act on the Linecast widget the
-  // bar would route a hotkey to rather than on whichever copy happens to
-  // hold the IPC target.
+  // open/close/toggle name no pill, so they stay within the plugin whose
+  // target they arrived on and pick the copy the bar would route a hotkey to
+  // — per monitor, rather than whichever one happens to hold the target.
   function ipcPanelWidget() {
-    var slots = bar && bar.moduleSlots ? bar.moduleSlots : []
-    var mine = []
-    for (var i = 0; i < slots.length; i++) {
-      var slot = slots[i]
-      if (slot && slot.activeItem && slot.moduleName === root.moduleName) mine.push(slot)
-    }
+    var mine = familySlots(true)
     if (mine.length === 0) return root
     var target = pickOwnerSlot(mine)
     return target && target.activeItem ? target.activeItem : root
@@ -271,10 +307,15 @@ BarWidget {
     }
   }
 
+  // One target per plugin id — `ashuttl.linecast`, `ashuttl.linecast-tides`,
+  // and so on — so each companion answers under its own name. Held back
+  // until the bar has injected the id, or the handlers would all register
+  // an empty target and collide.
   IpcHandler {
-    target: "ashuttl.linecast"
+    target: root.moduleName
+    enabled: root.moduleName !== ""
 
-    function refresh(): void { root.broadcast("refresh") }
+    function refresh(): void { root.refreshFamily() }
     function open(): void { root.ipcPanelWidget().open() }
     function close(): void { root.ipcPanelWidget().close() }
     function show(): void { root.ipcPanelWidget().open() }

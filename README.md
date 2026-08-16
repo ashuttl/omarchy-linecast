@@ -11,10 +11,9 @@ arc, moon, and tides.
 - **Weather pill**, always visible: icon + temperature, full oneline summary
   as tooltip. **Sunshine, moon, and tide pills** tuck away and slide out on
   hover (the same gesture as the stock indicators widget).
-- **Or take the pills apart.** The widget can be added more than once, so
-  the four don't have to travel together: give each one its own entry and
-  put weather beside the clock and tides over by the tray, each with its
-  own panel anchored under it. See [Several widgets](#several-widgets).
+- **Or take the pills apart**, with the companion plugins — weather beside
+  the clock, tides over by the tray, each dragged where you want it. See
+  [Placing the pills separately](#placing-the-pills-separately).
 - **Left click on any pill opens its panel**, anchored to that pill; right
   click opens the full linecast TUI in a floating terminal. `r` refetches,
   `Escape` closes, `Tab` switches to neighboring bar panels.
@@ -68,32 +67,39 @@ Inline in the widget's `shell.json` entry (hot-reloads on save):
   the extras in on hover.
 - `weatherRefreshSeconds` (default 600) — weather pill refresh interval.
 
-## Several widgets
+## Placing the pills separately
 
-The manifest sets `allowMultiple`, so the bar takes as many Linecast
-entries as you want. One pill each spreads them around the bar, and every
-one keeps its own panel, anchored under itself:
+Each of the other three pills is also published as its own small plugin,
+so it gets its own spot on the bar and its own panel anchored under it:
 
-```json
-"center": [
-  { "id": "ashuttl.clock" },
-  { "id": "ashuttl.linecast", "pills": ["weather"] }
-],
-"right": [
-  { "id": "ashuttl.linecast", "pills": ["tides"] },
-  { "id": "omarchy.tray" }
-]
+- [omarchy-linecast-sunshine](https://github.com/ashuttl/omarchy-linecast-sunshine)
+- [omarchy-linecast-moon](https://github.com/ashuttl/omarchy-linecast-moon)
+- [omarchy-linecast-tides](https://github.com/ashuttl/omarchy-linecast-tides)
+
+```bash
+omarchy plugin add https://github.com/ashuttl/omarchy-linecast-tides.git --enable
 ```
 
-Two things to know:
+They're thin: each one is this plugin's `BarWidget` with its pill fixed and
+a manifest of its own, loaded from `../ashuttl.linecast`. So they need this
+plugin installed, and there's still only one copy of the scripts, the panel,
+and the views. Tell this widget which pills to keep, so nothing shows twice:
 
-- **Place them by editing `shell.json`.** `omarchy bar put/move/set` and
-  `omarchy plugin enable/disable` all address a widget by its plugin id,
-  which no longer picks out one entry. They still work when a single
-  Linecast widget is on the bar.
-- **Grouped widgets reveal on their own hover** as well as on the bar's
-  center-section hold, so a widget carrying extras works just as well
-  parked in `left` or `right`.
+```json
+{ "id": "ashuttl.linecast", "pills": ["weather"] }
+```
+
+**Why separate plugins rather than several entries of this one?** Because
+Omarchy identifies a bar widget by its plugin id and nothing else. Bar
+reordering resolves the dragged widget with a first-match-by-id lookup
+(`Bar.moveModuleInConfig`), so duplicate ids move whichever entry comes
+first rather than the one under the pointer — and `omarchy bar move/set`
+and `omarchy plugin enable/disable` all pick the first match too. Distinct
+ids make drag-and-drop and the CLI work normally.
+
+Grouping still works if you want it: any of these widgets takes a `pills`
+list, and a widget carrying extras reveals them on its own hover as well as
+on the bar's center-section hold, so it works parked in any section.
 
 ## Notes
 
@@ -112,6 +118,10 @@ omarchy-shell shell toggle ashuttl.linecast        # last-used face
 ```
 
 `openSection` finds the widget carrying that pill and opens its panel
-there. The plain `toggle` names no pill, so with several widgets up it
-acts on whichever one the bar would route a hotkey to — bind
-`openSection` per pill if you want a key each.
+there, including when that widget came from a companion plugin — so these
+keep working however the pills are arranged. Each companion also answers
+under its own id:
+
+```bash
+omarchy-shell ashuttl.linecast-tides toggle
+```

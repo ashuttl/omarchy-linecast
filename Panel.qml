@@ -11,8 +11,10 @@ import qs.Ui
 // `anchorItem` at the matching pill before opening.
 Panel {
   id: root
-  moduleName: "ashuttl.linecast"
-  ipcTarget: "ashuttl.linecast"
+  // Identity follows the widget that hosts this panel, so a companion
+  // plugin's panel answers to that plugin. The widget owns the IPC.
+  moduleName: hostWidget ? hostWidget.moduleName : ""
+  ipcTarget: ""
   manageIpc: false
 
   property var anchorItem: null

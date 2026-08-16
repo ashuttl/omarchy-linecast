@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ashuttl.linecast",
   "name": "Linecast",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "author": "Andrew Shuttleworth",
   "license": "MIT",
   "description": "Weather, sun, moon, and tide pills from linecast, each with an anchored panel",
@@ -14,9 +14,9 @@
   },
   "barWidget": {
     "displayName": "Linecast",
-    "description": "Weather, sunshine, moon, and tide pills with anchored panels — add one widget per pill to spread them around the bar",
+    "description": "Weather, sunshine, moon, and tide pills with anchored panels — install the companion plugins to place each pill separately",
     "category": "Weather",
-    "allowMultiple": true,
+    "allowMultiple": false,
     "schema": [
       {
         "key": "pills",
