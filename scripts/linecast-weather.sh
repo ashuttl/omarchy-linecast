@@ -9,7 +9,7 @@ if ! command -v linecast >/dev/null 2>&1; then
   exit 0
 fi
 
-line=$(linecast weather --oneline --print 2>/dev/null)
+line=$(linecast weather --oneline --print ${LINECAST_TEMP:-} 2>/dev/null)
 
 if [[ -z "$line" ]]; then
   # Collapse the module when weather is unavailable (matches omarchy default behavior)

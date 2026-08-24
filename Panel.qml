@@ -69,10 +69,16 @@ Panel {
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
+  // The temperature scale is the widget's own setting, passed to linecast
+  // as a flag on every call, so it splits from linecast's metric/imperial
+  // switch (wind, rain, tide heights) — °C with mph is a real combination.
+  readonly property string tempFlag: settings && settings.temperature === "celsius" ? " --celsius"
+    : settings && settings.temperature === "fahrenheit" ? " --fahrenheit" : ""
+
   // Float one of linecast's views in a terminal: weather, sunshine, moon,
   // tides, radar, or maps.
   function launch(name) {
-    if (root.bar) root.bar.run(root.pluginDir + "scripts/linecast-toggle.sh " + name)
+    if (root.bar) root.bar.run("LINECAST_TEMP='" + root.tempFlag.trim() + "' " + root.pluginDir + "scripts/linecast-toggle.sh " + name)
   }
 
   function open() {

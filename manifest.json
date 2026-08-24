@@ -72,6 +72,27 @@
             "label": "12-hour"
           }
         ]
+      },
+      {
+        "key": "temperature",
+        "type": "select",
+        "label": "Temperature",
+        "description": "Temperature scale, independent of linecast's metric/imperial setting.",
+        "defaultValue": "",
+        "options": [
+          {
+            "value": "",
+            "label": "Follow linecast"
+          },
+          {
+            "value": "fahrenheit",
+            "label": "Fahrenheit"
+          },
+          {
+            "value": "celsius",
+            "label": "Celsius"
+          }
+        ]
       }
     ]
   }

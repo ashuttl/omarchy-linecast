@@ -62,6 +62,9 @@ BarWidget {
     return result.length > 0 ? result : defaultPills
   }
 
+  readonly property string tempFlag: root.setting("temperature", "") === "celsius" ? "--celsius"
+    : root.setting("temperature", "") === "fahrenheit" ? "--fahrenheit" : ""
+
   function sectionEnabled(section) {
     return pillOrder.indexOf(section) !== -1
   }
@@ -405,7 +408,7 @@ BarWidget {
 
     Process {
       id: pillProc
-      command: ["bash", "-lc", "PILL_CLOCK=" + root.setting("clock", "24h") + " " + root.scriptsDir + "/linecast-" + pill.pillName + ".sh"]
+      command: ["bash", "-lc", "PILL_CLOCK=" + root.setting("clock", "24h") + " LINECAST_TEMP='" + root.tempFlag + "' " + root.scriptsDir + "/linecast-" + pill.pillName + ".sh"]
       stdout: StdioCollector {
         waitForEnd: true
         onStreamFinished: pill.update(text)

@@ -95,6 +95,14 @@ Item {
     }
   }
 
+  function setTemperature(key) {
+    if (!view.host) return
+    view.host.persistSettings({ temperature: key })
+    // The flag changed under every feed and pill: same fan-out as a
+    // location change.
+    view.locationChangedByUser()
+  }
+
   function setUnits(key) {
     if (view.unitsBusy) return
     view.unitsBusy = true
@@ -139,7 +147,7 @@ Item {
 
   JsonFeed {
     id: feed
-    command: "linecast weather --json"
+    command: "linecast weather --json" + (view.host ? view.host.tempFlag : "")
     onPayloadChanged: hourlyChart.requestPaint()
   }
 
@@ -674,7 +682,12 @@ Item {
           x: Math.max(hourlyFlick.contentX + 4,
              Math.min(hourlyFlick.contentX + hourlyFlick.width - width - 4,
                       (hourlyChart.hoverIndex + 0.5) * hourlyChart.hourW + Style.space(14)))
-          y: hourlyChart.plotTop
+          // Rides with the pointer like the TUI's chip: above it when
+          // there's room, below it near the top.
+          y: {
+            var above = chartMouse.mouseY - height - Style.space(10)
+            return above >= 0 ? above : Math.min(hourlyChart.height - height, chartMouse.mouseY + Style.space(14))
+          }
           width: chipColumn.implicitWidth + Style.space(16)
           height: chipColumn.implicitHeight + Style.space(12)
           color: Color.tooltip.background
@@ -1014,8 +1027,9 @@ Item {
       }
     }
 
-    // ---- Units and the clock. Units are linecast's own setting, so the
-    //      pills, the panels, and the terminal views all agree.
+    // ---- Temperature, measures, and the clock. Temperature is the
+    //      widget's own setting (a flag on every linecast call); measures
+    //      are linecast's units switch, so the terminal views agree.
     Row {
       visible: !!view.current
       width: parent.width
@@ -1023,8 +1037,8 @@ Item {
 
       Repeater {
         model: [
-          { key: "imperial", label: "°F", tip: "Fahrenheit, mph, inches, feet" },
-          { key: "metric", label: "°C", tip: "Celsius, km/h, mm, metres" }
+          { key: "fahrenheit", label: "°F", tip: "Fahrenheit" },
+          { key: "celsius", label: "°C", tip: "Celsius" }
         ]
 
         Button {
@@ -1034,10 +1048,10 @@ Item {
           tooltipText: modelData.tip
           fontSize: Style.font.bodySmall
           bordered: true
-          selected: (view.tempUnit === "°C") === (modelData.key === "metric")
+          selected: (view.tempUnit === "°C") === (modelData.key === "celsius")
           foreground: view.foreground
           fontFamily: view.fontFamily
-          onClicked: view.setUnits(modelData.key)
+          onClicked: view.setTemperature(modelData.key)
         }
       }
 
@@ -1057,6 +1071,32 @@ Item {
           foreground: view.foreground
           fontFamily: view.fontFamily
           onClicked: if (view.host) { view.host.persistSettings({ clock: modelData.key }); hourlyChart.requestPaint() }
+        }
+      }
+    }
+
+    Row {
+      visible: !!view.current
+      width: parent.width
+      spacing: Style.space(6)
+
+      Repeater {
+        model: [
+          { key: "imperial", label: "mph · in · ft", tip: "Wind in mph, rain in inches, tides in feet" },
+          { key: "metric", label: "km/h · mm · m", tip: "Wind in km/h, rain in mm, tides in metres" }
+        ]
+
+        Button {
+          required property var modelData
+          width: (parent.width - Style.space(6)) / 2
+          text: modelData.label
+          tooltipText: modelData.tip
+          fontSize: Style.font.bodySmall
+          bordered: true
+          selected: (view.windUnit === "km/h") === (modelData.key === "metric")
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+          onClicked: view.setUnits(modelData.key)
         }
       }
     }

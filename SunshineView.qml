@@ -309,6 +309,7 @@ Item {
 
       // Hover scrubs the day; leaving snaps back to now.
       MouseArea {
+        id: scrubMouse
         anchors.fill: parent
         hoverEnabled: true
         acceptedButtons: Qt.NoButton
@@ -327,7 +328,10 @@ Item {
           return sx < parent.width / 2 ? Math.min(parent.width - width - 4, sx + Style.space(14))
                                         : Math.max(4, sx - width - Style.space(14))
         }
-        y: Style.space(6)
+        y: {
+          var above = scrubMouse.mouseY - height - Style.space(10)
+          return above >= 0 ? above : Math.min(parent.height - height, scrubMouse.mouseY + Style.space(14))
+        }
         width: scrubColumn.implicitWidth + Style.space(16)
         height: scrubColumn.implicitHeight + Style.space(12)
         color: Color.tooltip.background

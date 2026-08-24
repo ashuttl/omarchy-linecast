@@ -89,6 +89,11 @@ on save:
 
 - `alwaysShow` (default `false`) — keep every pill out instead of sliding
   the extras in on hover.
+- `clock` (default `24h`) — `24h` or `12h` times in the pills and panels.
+- `temperature` (default: follow linecast) — `fahrenheit` or `celsius`,
+  independent of linecast's metric/imperial setting, so °C with mph is a
+  choice. Wind, rain, and tide-height units come from `linecast units
+  metric|imperial`, which the panel's buttons set.
 
 Location follows `linecast location`; change it from the weather panel or
 with `linecast location set <place>` and every pill and panel follows.

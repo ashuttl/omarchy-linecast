@@ -332,6 +332,7 @@ Item {
       }
 
       MouseArea {
+        id: hoverMouse
         anchors.fill: parent
         hoverEnabled: true
         acceptedButtons: Qt.NoButton
@@ -354,7 +355,10 @@ Item {
           return hx < plotW / 2 ? Math.min(plotW - width - 4, hx + Style.space(14))
                                 : Math.max(4, hx - width - Style.space(14))
         }
-        y: Style.space(30)
+        y: {
+          var above = hoverMouse.mouseY - height - Style.space(10)
+          return above >= 0 ? above : Math.min(parent.height - height, hoverMouse.mouseY + Style.space(14))
+        }
         width: hoverColumn.implicitWidth + Style.space(16)
         height: hoverColumn.implicitHeight + Style.space(12)
         color: Color.tooltip.background
