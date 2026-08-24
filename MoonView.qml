@@ -113,6 +113,7 @@ Item {
     spacing: Style.space(10)
 
     Text {
+      textFormat: Text.PlainText
       visible: !view.payload
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -161,6 +162,7 @@ Item {
           spacing: 0
 
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: (modelData.kind === "rise" ? "↑ " : "↓ ") + Model.clockLabel(modelData.time)
             color: view.foreground
@@ -169,6 +171,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: modelData.kind === "rise" ? "moonrise" : "moonset"
             color: view.muted

@@ -148,6 +148,7 @@ Item {
     spacing: Style.space(10)
 
     Text {
+      textFormat: Text.PlainText
       visible: !view.payload
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -345,6 +346,7 @@ Item {
           spacing: Style.space(1)
 
           Text {
+            textFormat: Text.PlainText
             text: Model.clockLabelMs(view.focusMs)
             color: Color.tooltip.text
             font.family: view.fontFamily
@@ -353,6 +355,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: isNaN(view.focusElev) ? ""
               : (view.focusElev >= 0 ? Math.round(view.focusElev) + "° above the horizon"
                                      : Math.round(-view.focusElev) + "° below the horizon")
@@ -362,6 +365,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: view.twilightWord(view.focusElev)
             color: Qt.darker(Color.tooltip.text, 1.3)
             font.family: view.fontFamily
@@ -378,6 +382,7 @@ Item {
       height: dayLength.implicitHeight
 
       Text {
+        textFormat: Text.PlainText
         anchors.left: parent.left
         text: "󰖜 " + Model.clockLabel(view.payload ? view.payload.sunrise : "")
         color: view.foreground
@@ -391,6 +396,7 @@ Item {
         spacing: Style.space(6)
 
         Text {
+          textFormat: Text.PlainText
           text: view.payload && view.payload.day_length_seconds !== null
             ? Model.fmtDuration(view.payload.day_length_seconds) : ""
           color: view.foreground
@@ -399,6 +405,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: view.payload ? "(" + Model.fmtDeltaDuration(view.payload.day_length_delta_seconds) + ")" : ""
           visible: text !== "()"
           color: view.muted
@@ -408,6 +415,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         anchors.right: parent.right
         text: Model.clockLabel(view.payload ? view.payload.sunset : "") + " 󰖛"
         color: view.foreground

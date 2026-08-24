@@ -16,6 +16,7 @@ Row {
   visible: value !== ""
 
   Text {
+    textFormat: Text.PlainText
     id: labelText
     text: pair.label
     color: pair.foreground
@@ -30,6 +31,7 @@ Row {
   }
 
   Text {
+    textFormat: Text.PlainText
     id: valueText
     text: pair.value
     color: pair.foreground

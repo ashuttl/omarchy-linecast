@@ -106,6 +106,7 @@ Item {
     spacing: Style.space(10)
 
     Text {
+      textFormat: Text.PlainText
       visible: !view.payload || !view.payload.station
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -372,6 +373,7 @@ Item {
           spacing: Style.space(1)
 
           Text {
+            textFormat: Text.PlainText
             text: {
               var tag = Model.dayTag(new Date(view.hoverMs).toISOString(), view.nowMs)
               var d = new Date(view.hoverMs)
@@ -385,6 +387,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: view.fmtHeight(view.hoverHeight)
             color: Color.tooltip.text
             font.family: view.fontFamily
@@ -393,6 +396,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: view.hovering ? (view.hoverRising ? "rising" : "falling") : ""
             color: Qt.darker(Color.tooltip.text, 1.3)
             font.family: view.fontFamily
@@ -419,6 +423,7 @@ Item {
           height: kindText.implicitHeight
 
           Text {
+            textFormat: Text.PlainText
             id: kindText
             text: (modelData.kind === "high" ? "▲ High" : "▼ Low")
             color: view.foreground
@@ -427,6 +432,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.horizontalCenter: parent.horizontalCenter
             text: Model.clockLabel(modelData.time) + (Model.dayTag(modelData.time, view.nowMs) !== "" ? " " + Model.dayTag(modelData.time, view.nowMs) : "")
             color: view.foreground
@@ -435,6 +441,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.right: parent.right
             text: view.fmtHeight(modelData.height)
             color: view.muted

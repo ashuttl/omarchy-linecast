@@ -225,6 +225,7 @@ Item {
     spacing: Style.space(10)
 
     Text {
+      textFormat: Text.PlainText
       visible: !view.payload
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -303,6 +304,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: view.locBusy
         topPadding: Style.space(4)
         text: "Looking…"
@@ -329,6 +331,7 @@ Item {
     }
 
     Text {
+      textFormat: Text.PlainText
       visible: !!(view.payload && view.payload.summary) && !view.locMenuOpen
       width: parent.width
       wrapMode: Text.WordWrap
@@ -369,6 +372,7 @@ Item {
             height: badgeText.implicitHeight + Style.space(4)
 
             Text {
+              textFormat: Text.PlainText
               id: badgeText
               anchors.centerIn: parent
               text: "󰀦 " + (alertItem.modelData.event || alertItem.modelData.headline || "Alert")
@@ -380,6 +384,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: alertWhen
             anchors.verticalCenter: parent.verticalCenter
             x: badge.width + Style.space(8)
@@ -390,6 +395,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             x: alertWhen.x + alertWhen.implicitWidth + (alertWhen.text !== "" ? Style.space(8) : 0)
             width: Math.max(0, parent.width - x)
@@ -409,6 +415,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: alertItem.expanded
           width: parent.width
           text: String(alertItem.modelData.description || "")
@@ -419,6 +426,7 @@ Item {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: alertItem.expanded && !!alertItem.modelData.url
           text: String(alertItem.modelData.url || "")
           elide: Text.ElideMiddle
@@ -430,7 +438,7 @@ Item {
           MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: Qt.openUrlExternally(alertItem.modelData.url)
+            onClicked: if (/^https?:\/\//i.test(String(alertItem.modelData.url))) Qt.openUrlExternally(alertItem.modelData.url)
           }
         }
       }
@@ -672,6 +680,7 @@ Item {
             spacing: Style.space(1)
 
             Text {
+              textFormat: Text.PlainText
               text: hourlyChart.hoverHour ? Model.clockLabel(hourlyChart.hoverHour.time) : ""
               color: Color.tooltip.text
               font.family: view.fontFamily
@@ -682,6 +691,7 @@ Item {
               spacing: Style.space(5)
 
               Text {
+                textFormat: Text.PlainText
                 text: hourlyChart.hoverHour ? Model.roundTemp(hourlyChart.hoverHour.temperature) : ""
                 color: hourlyChart.hoverHour
                   ? Model.tempColor(hourlyChart.hoverHour.temperature, view.tempUnit, view.tempStops)
@@ -692,6 +702,7 @@ Item {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: hourlyChart.hoverHour && Model.num(hourlyChart.hoverHour.feels_like, NaN) === Model.num(hourlyChart.hoverHour.feels_like, NaN)
                 text: hourlyChart.hoverHour ? "feels " + Model.roundTemp(hourlyChart.hoverHour.feels_like) : ""
                 color: Qt.darker(Color.tooltip.text, 1.3)
@@ -701,6 +712,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: hourlyChart.hoverHour ? (hourlyChart.hoverHour.condition || "") : ""
               color: Color.tooltip.text
               font.family: view.fontFamily
@@ -708,6 +720,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: hourlyChart.hoverHour && Model.num(hourlyChart.hoverHour.precipitation_probability, 0) >= 15
               text: hourlyChart.hoverHour ? Math.round(Model.num(hourlyChart.hoverHour.precipitation_probability, 0)) + "% precip" : ""
               color: {
@@ -756,6 +769,7 @@ Item {
           height: Math.max(dayName.implicitHeight, Style.space(16))
 
           Text {
+            textFormat: Text.PlainText
             id: dayName
             anchors.verticalCenter: parent.verticalCenter
             width: Style.space(52)
@@ -767,6 +781,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: dayIcon
             anchors.verticalCenter: parent.verticalCenter
             x: dayName.width
@@ -798,6 +813,7 @@ Item {
                - Model.extentPos(dayRow.modelData.low, view.weekExtent)) * (width - 2 * inset))
 
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               x: rangeArea.fillX - width - Style.space(6)
               text: Model.roundTemp(dayRow.modelData.low)
@@ -835,6 +851,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               x: rangeArea.fillX + rangeArea.fillW + Style.space(6)
               text: Model.roundTemp(dayRow.modelData.high)
@@ -851,6 +868,7 @@ Item {
             spacing: Style.space(6)
 
             Text {
+              textFormat: Text.PlainText
               text: dayRow.precipLabel
               visible: text !== ""
               color: {
@@ -862,6 +880,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: dayRow.windLabel
               visible: text !== ""
               color: view.muted
@@ -951,6 +970,7 @@ Item {
         height: settingsLabel.implicitHeight + Style.space(4)
 
         Text {
+          textFormat: Text.PlainText
           id: settingsLabel
           anchors.verticalCenter: parent.verticalCenter
           text: (view.settingsOpen ? "▾" : "▸") + "  PILLS, UNITS, AND CLOCK"
@@ -1095,6 +1115,7 @@ Item {
       spacing: Style.space(6)
 
       Text {
+        textFormat: Text.PlainText
         text: "IN THE TERMINAL"
         color: view.muted
         font.family: view.fontFamily
@@ -1130,6 +1151,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         width: parent.width
         text: view.linecastSource === "installed"
           ? "Running your installed linecast."

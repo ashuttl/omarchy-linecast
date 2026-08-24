@@ -54,6 +54,7 @@ Item {
     }
 
     Text {
+      textFormat: Text.PlainText
       visible: header.iconComponent === null && header.icon !== ""
       anchors.verticalCenter: parent.verticalCenter
       text: header.icon
@@ -67,6 +68,7 @@ Item {
       width: Math.max(0, parent.width - x)
 
       Text {
+        textFormat: Text.PlainText
         text: header.title + (header.interactive ? "  ▾" : "")
         color: header.titleColor
         font.family: header.fontFamily
@@ -77,6 +79,7 @@ Item {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: text !== ""
         text: header.subtitle.toUpperCase()
         color: Qt.darker(header.foreground, 1.4)
@@ -91,6 +94,7 @@ Item {
   }
 
   Text {
+    textFormat: Text.PlainText
     id: bigText
     visible: text !== ""
     anchors.right: parent.right
