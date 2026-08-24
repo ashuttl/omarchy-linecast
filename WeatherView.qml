@@ -1005,25 +1005,17 @@ Item {
         }
       }
 
-      Row {
+      Button {
         width: parent.width
-        spacing: Style.space(8)
-
-        ToggleSwitch {
-          id: alwaysOutSwitch
-          anchors.verticalCenter: parent.verticalCenter
-          checked: view.pillsAlwaysOut
-          foreground: view.foreground
-          onToggled: if (view.host) view.host.persistSettings({ alwaysShow: !view.pillsAlwaysOut })
-        }
-
-        Text {
-          anchors.verticalCenter: parent.verticalCenter
-          text: view.pillsAlwaysOut ? "Every pill stays out" : "Extra pills slide out on hover"
-          color: view.muted
-          font.family: view.fontFamily
-          font.pixelSize: Style.font.bodySmall
-        }
+        iconText: view.pillsAlwaysOut ? "󰄲" : "󰄱"
+        text: "Keep every pill out, not just on hover"
+        fontSize: Style.font.bodySmall
+        bordered: true
+        leftAlign: true
+        selected: view.pillsAlwaysOut
+        foreground: view.foreground
+        fontFamily: view.fontFamily
+        onClicked: if (view.host) view.host.persistSettings({ alwaysShow: !view.pillsAlwaysOut })
       }
     }
 
