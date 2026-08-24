@@ -113,6 +113,8 @@ Item {
   }
 
   property bool locMenuOpen: false
+  // The settings block (pills, units, clock) stays folded until asked for.
+  property bool settingsOpen: false
 
   function refresh() { feed.refresh() }
 
@@ -937,20 +939,41 @@ Item {
 
     PanelSeparator { visible: !!view.current; foreground: view.foreground }
 
-    // ---- The bar: which of linecast's pills ride in it.
+    // ---- Settings, folded: which pills ride in the bar, temperature,
+    //      measures, and the clock.
     Column {
       visible: !!view.current
       width: parent.width
       spacing: Style.space(6)
 
-      Text {
-        text: "PILLS IN THE BAR"
-        color: view.muted
-        font.family: view.fontFamily
-        font.pixelSize: Style.font.caption
-        font.bold: true
-        font.letterSpacing: 1.2
+      Item {
+        width: parent.width
+        height: settingsLabel.implicitHeight + Style.space(4)
+
+        Text {
+          id: settingsLabel
+          anchors.verticalCenter: parent.verticalCenter
+          text: (view.settingsOpen ? "▾" : "▸") + "  PILLS, UNITS, AND CLOCK"
+          color: settingsMouse.containsMouse ? Style.hoverStateColor(view.muted, Color.accent) : view.muted
+          font.family: view.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
+          font.letterSpacing: 1.2
+        }
+
+        MouseArea {
+          id: settingsMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: view.settingsOpen = !view.settingsOpen
+        }
       }
+
+      Column {
+        visible: view.settingsOpen
+        width: parent.width
+        spacing: Style.space(6)
 
       Row {
         width: parent.width
@@ -987,15 +1010,13 @@ Item {
         fontFamily: view.fontFamily
         onClicked: if (view.host) view.host.persistSettings({ alwaysShow: !view.pillsAlwaysOut })
       }
-    }
 
     // ---- Temperature, measures, and the clock. Temperature is the
     //      widget's own setting (a flag on every linecast call); measures
     //      are linecast's units switch, so the terminal views agree.
-    Row {
-      visible: !!view.current
-      width: parent.width
-      spacing: Style.space(6)
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
 
       Repeater {
         model: [
@@ -1037,10 +1058,9 @@ Item {
       }
     }
 
-    Row {
-      visible: !!view.current
-      width: parent.width
-      spacing: Style.space(6)
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
 
       Repeater {
         model: [
@@ -1060,6 +1080,9 @@ Item {
           fontFamily: view.fontFamily
           onClicked: view.setUnits(modelData.key)
         }
+      }
+    }
+
       }
     }
 
