@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "ashuttl.linecast",
   "name": "Linecast",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "author": "Andrew Shuttleworth",
   "license": "MIT",
   "description": "Weather, sun, moon, and tide pills from linecast, each opening a panel drawn in the theme",

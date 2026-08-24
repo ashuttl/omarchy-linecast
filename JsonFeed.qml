@@ -25,7 +25,10 @@ Item {
 
   Process {
     id: proc
-    command: ["bash", "-lc", feed.command + " 2>/dev/null"]
+    // head caps the pipe at the OS: a runaway payload is cut off out there
+    // instead of accumulating in this collector, and the truncated JSON
+    // fails parse so the last good payload stays.
+    command: ["bash", "-lc", "{ " + feed.command + " ; } 2>/dev/null | head -c 2097152"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

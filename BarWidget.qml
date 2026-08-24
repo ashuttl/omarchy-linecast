@@ -408,7 +408,7 @@ BarWidget {
 
     Process {
       id: pillProc
-      command: ["bash", "-lc", "PATH=" + root.pluginDir + "bin:$PATH PILL_CLOCK=" + root.setting("clock", "24h") + " LINECAST_TEMP='" + root.tempFlag + "' " + root.scriptsDir + "/linecast-" + pill.pillName + ".sh"]
+      command: ["bash", "-lc", "PATH=" + root.pluginDir + "bin:$PATH PILL_CLOCK=" + root.setting("clock", "24h") + " LINECAST_TEMP='" + root.tempFlag + "' " + root.scriptsDir + "/linecast-" + pill.pillName + ".sh | head -c 65536"]
       stdout: StdioCollector {
         waitForEnd: true
         onStreamFinished: pill.update(text)

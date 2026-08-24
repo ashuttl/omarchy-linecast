@@ -55,7 +55,7 @@ Item {
   property string linecastSource: ""
   Process {
     id: sourceProc
-    command: ["bash", "-lc", view.linecastBin + " --source"]
+    command: ["bash", "-lc", view.linecastBin + " --source | head -c 4096"]
     stdout: StdioCollector {
       onStreamFinished: view.linecastSource = text.trim()
     }
@@ -170,7 +170,7 @@ Item {
     if (locProc.running) return
     view.locBusy = true
     locProc.onDone = cb
-    locProc.command = ["bash", "-lc", cmd]
+    locProc.command = ["bash", "-lc", "{ " + cmd + " ; } | head -c 1048576"]
     locProc.running = true
   }
 
