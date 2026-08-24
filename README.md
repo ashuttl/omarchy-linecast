@@ -1,42 +1,52 @@
 # omarchy-linecast
 
 An [Omarchy](https://omarchy.org) bar-widget plugin for
-[linecast](https://github.com/ashuttl/linecast) — terminal weather, solar
-arc, moon, and tides.
+[linecast](https://github.com/ashuttl/linecast) — weather, the sun, the
+moon, and the tides, drawn for the terminal. The bar gets a pill for each;
+every pill opens a panel that matches the stock ones and re-inks itself
+when you switch themes.
 
 ![preview](preview.png)
 
 ## What you get
 
-- **Weather pill**, always visible: icon + temperature, full oneline summary
-  as tooltip. **Sunshine, moon, and tide pills** tuck away and slide out on
-  hover (the same gesture as the stock indicators widget).
-- **Or take the pills apart**, with the companion plugins — weather beside
-  the clock, tides over by the tray, each dragged where you want it. See
-  [Placing the pills separately](#placing-the-pills-separately).
-- **Left click on any pill opens its panel**, anchored to that pill; right
-  click opens the full linecast TUI in a floating terminal. `r` refetches,
-  `Escape` closes, `Tab` switches to neighboring bar panels.
-- **Weather panel**: current conditions with the plain-English comparison
-  line, weather alerts, a 24-hour temperature strip and a week of range
-  bars in linecast's temperature colors, and wind / humidity / sun times /
-  AQI at a glance.
-- **Sunshine panel**: countdown to the next sunrise/sunset over a drawn
-  solar arc with the sun at its current position, day length and its
-  day-to-day drift, solar noon, tomorrow's sunrise.
+- **Weather pill**, always visible: icon and temperature, the full oneline
+  summary as a tooltip. **Sunshine, moon, and tide pills** tuck away and
+  slide out on hover, the same gesture as the stock indicators widget —
+  or stay out, or stay hidden; your choice, from inside the panel.
+- **Left click on any pill opens its panel**, anchored to that pill.
+  Right click opens the matching linecast view in a floating terminal.
+  `r` refetches, `Escape` closes, `Tab` moves to the neighboring bar
+  panels.
+- **Weather panel**: current conditions with a plain-English comparison
+  to yesterday, weather alerts, a scrollable hourly temperature line and a
+  week of range bars in linecast's temperature colors, and wind, humidity,
+  sun times, and air quality at a glance. Click the place name to change
+  location.
+- **Sunshine panel**: the day's solar arc under a sky that follows the
+  hour, the sun at its current position, with sunrise, sunset, day length
+  and its day-to-day drift.
 - **Moon panel**: a drawn phase disc (correct terminator, hemisphere
-  aware), phase and illumination, moonrise/moonset, next full and new
-  moons.
-- **Tides panel**: countdown to the next high/low over the tide curve
-  (past dimmed, extremes marked), the upcoming turns, and the station
-  name.
+  aware), phase and illumination, moonrise and moonset, the next full and
+  new moons.
+- **Tides panel**: the tide curve for the day with the water marked at
+  now, the turns labeled, the next high or low, and the station name.
+- **Radar and Maps**, one click from the weather panel: linecast's live
+  precipitation radar and its terrain, street, and globe maps open in a
+  floating terminal.
+
+Everything is colored from the current Omarchy theme, and so is
+linecast itself, so the bar, the panels, and the terminal views all
+change together when you switch themes.
 
 ## Requirements
 
-- linecast with `weather --json` support (newer than v1.8.0; in the dev
-  tree as of 2026-08-14)
-- A Nerd Font in the bar (linecast's default glyph set)
-- `jq` (used by the pill scripts)
+- [linecast](https://github.com/ashuttl/linecast) 1.9 or newer. On
+  Omarchy it's in the AUR: `yay -S linecast`. Or, with uv:
+  `uv tool install linecast`. If it's missing, the weather panel offers
+  to install it.
+- A Nerd Font in the bar (Omarchy's default) for the weather glyphs.
+- `jq`, which Omarchy already ships.
 
 ## Install
 
@@ -50,14 +60,28 @@ Then add the widget to the bar if it wasn't added automatically:
 omarchy bar move ashuttl.linecast --section center
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove ashuttl.linecast
+```
+
+That takes the widget off the bar and deletes the plugin. It leaves
+linecast installed (`yay -R linecast` or `uv tool uninstall linecast`
+if you want it gone too), and a few small files you can delete by hand:
+the pill caches at `~/.cache/omarchy-bar-*-oneline` and the location
+recents at `~/.local/state/omarchy/linecast-recent-locations.json`.
+
 ## Settings
 
-Inline in the widget's `shell.json` entry (hot-reloads on save):
+Which pills show is set from the weather panel (the **Pills** row at the
+bottom), or inline in the widget's `shell.json` entry, which hot-reloads
+on save:
 
-- `pills` (default `["weather", "sunshine", "moon", "tides"]`) — which
-  pills show, in display order. The first entry is the always-visible
-  pill and hosts the popup; the rest slide out on hover.
-  For example, weather and tides only:
+- `pills` (default all four: `["weather", "sunshine", "moon", "tides"]`)
+  — which pills show, in order. The first is the always-visible pill and
+  hosts the panel; the rest slide out on hover. Weather and tides only,
+  for instance:
 
   ```json
   { "id": "ashuttl.linecast", "pills": ["weather", "tides"] }
@@ -65,63 +89,27 @@ Inline in the widget's `shell.json` entry (hot-reloads on save):
 
 - `alwaysShow` (default `false`) — keep every pill out instead of sliding
   the extras in on hover.
-- `weatherRefreshSeconds` (default 600) — weather pill refresh interval.
 
-## Placing the pills separately
+Location follows `linecast location`; change it from the weather panel or
+with `linecast location set <place>` and every pill and panel follows.
 
-Each of the other three pills is also published as its own small plugin,
-so it gets its own spot on the bar and its own panel anchored under it:
+## Scripting
 
-- [omarchy-linecast-sunshine](https://github.com/ashuttl/omarchy-linecast-sunshine)
-- [omarchy-linecast-moon](https://github.com/ashuttl/omarchy-linecast-moon)
-- [omarchy-linecast-tides](https://github.com/ashuttl/omarchy-linecast-tides)
-
-```bash
-omarchy plugin add https://github.com/ashuttl/omarchy-linecast-tides.git --enable
-```
-
-They're thin: each one is this plugin's `BarWidget` with its pill fixed and
-a manifest of its own, loaded from `../ashuttl.linecast`. So they need this
-plugin installed, and there's still only one copy of the scripts, the panel,
-and the views. Tell this widget which pills to keep, so nothing shows twice:
-
-```json
-{ "id": "ashuttl.linecast", "pills": ["weather"] }
-```
-
-**Why separate plugins rather than several entries of this one?** Because
-Omarchy identifies a bar widget by its plugin id and nothing else. Bar
-reordering resolves the dragged widget with a first-match-by-id lookup
-(`Bar.moveModuleInConfig`), so duplicate ids move whichever entry comes
-first rather than the one under the pointer — and `omarchy bar move/set`
-and `omarchy plugin enable/disable` all pick the first match too. Distinct
-ids make drag-and-drop and the CLI work normally.
-
-Grouping still works if you want it: any of these widgets takes a `pills`
-list, and a widget carrying extras reveals them on its own hover as well as
-on the bar's center-section hold, so it works parked in any section.
-
-## Notes
-
-The pills shell out to `scripts/linecast-*.sh`, which cache linecast's
-`--oneline` output under `~/.cache/`; each panel face runs its
-`linecast <command> --json` on first open and refetches when stale.
-Location follows `linecast location`, and the picker's recents are shared
-by every Linecast widget in
-`~/.local/state/omarchy/linecast-recent-locations.json`.
-
-Panels can be driven from scripts or keybindings:
+Panels can be driven from keybindings or scripts:
 
 ```bash
 omarchy-shell ashuttl.linecast openSection tides   # weather|sunshine|moon|tides
 omarchy-shell shell toggle ashuttl.linecast        # last-used face
 ```
 
-`openSection` finds the widget carrying that pill and opens its panel
-there, including when that widget came from a companion plugin — so these
-keep working however the pills are arranged. Each companion also answers
-under its own id:
+## Notes
 
-```bash
-omarchy-shell ashuttl.linecast-tides toggle
-```
+The pills shell out to `scripts/linecast-*.sh`, which cache linecast's
+`--oneline` output under `~/.cache/`; each panel runs its
+`linecast <command> --json` on first open and refetches when stale. Nothing
+here talks to the network directly — linecast does, to Open-Meteo, NOAA,
+and the other sources it documents.
+
+## License
+
+MIT.
