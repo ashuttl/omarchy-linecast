@@ -2,6 +2,13 @@
 # Omarchy bar module: linecast weather
 # Bar shows "<icon> <temp>", tooltip shows the full oneline summary.
 
+if ! command -v linecast >/dev/null 2>&1; then
+  # No linecast yet: the pill stays visible so the panel can offer to
+  # install it.
+  echo '{"text": "󰖐 Linecast", "tooltip": "linecast is not installed — open the panel to install it", "class": "missing"}'
+  exit 0
+fi
+
 line=$(linecast weather --oneline --print 2>/dev/null)
 
 if [[ -z "$line" ]]; then

@@ -23,10 +23,17 @@ function num(value, fallback) {
 }
 
 // "2026-08-14T14:00" -> "2p" (linecast's own compact hour style).
+// Omarchy keeps a 24-hour clock, so the labels do too unless the widget's
+// `clock` setting says "12h". Shared across every importer (.pragma
+// library), set once by the panel.
+var clock24 = true
+function setClock24(on) { clock24 = !!on }
+
 function hourLabel(isoTime) {
   var m = /T(\d{2}):/.exec(String(isoTime || ""))
   if (!m) return ""
   var h = parseInt(m[1], 10)
+  if (clock24) return (h < 10 ? "0" : "") + h
   var suffix = h < 12 ? "a" : "p"
   var display = h % 12
   if (display === 0) display = 12
@@ -38,6 +45,7 @@ function clockLabel(isoTime) {
   var m = /T(\d{2}):(\d{2})/.exec(String(isoTime || ""))
   if (!m) return ""
   var h = parseInt(m[1], 10)
+  if (clock24) return (h < 10 ? "0" : "") + h + ":" + m[2]
   var suffix = h < 12 ? "a" : "p"
   var display = h % 12
   if (display === 0) display = 12
@@ -178,7 +186,7 @@ function contrastRatio(a, b) {
 // against the background, its bright twin when it doesn't — the TUI's
 // best_contrast pick. New-format themes name their colors; generated
 // palettes (colors-from-alacritty) only have color0..15 slots.
-var ANSI_SLOT = { red: 1, green: 2, yellow: 3, blue: 4, magenta: 5, cyan: 6 }
+var ANSI_SLOT = { red: 1, green: 2, yellow: 3, blue: 4, magenta: 5, cyan: 6, white: 7 }
 
 function themeAnchor(colors, name, bg, fallback) {
   var slot = ANSI_SLOT[name]
@@ -350,4 +358,137 @@ function windLine(current, units) {
   var gusts = num(current ? current.wind_gusts : NaN, NaN)
   if (!isNaN(gusts) && gusts >= speed + 5) line += " (" + Math.round(gusts) + ")"
   return line
+}
+
+// ---- The sunshine TUI's sky: sun elevation (degrees) to colors at the
+// horizon near the sun, at the horizon far from it, and at the zenith.
+// Built from the theme's ANSI palette like the TUI does, with fixed stops
+// when no palette is at hand.
+
+function lerpRgb(a, b, t) {
+  return { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t }
+}
+
+function darkenRgb(c, f) {
+  return { r: c.r * (1 - f), g: c.g * (1 - f), b: c.b * (1 - f) }
+}
+
+function rgbOf(color) {
+  return { r: color.r, g: color.g, b: color.b }
+}
+
+function buildSkyStops(colors, background) {
+  var bg = rgbOf(background)
+  var fixed = {
+    blue: { r: 0.36, g: 0.58, b: 0.90 }, cyan: { r: 0.55, g: 0.80, b: 0.90 },
+    magenta: { r: 0.72, g: 0.45, b: 0.78 }, red: { r: 0.85, g: 0.38, b: 0.35 },
+    yellow: { r: 0.93, g: 0.76, b: 0.35 }, white: { r: 0.92, g: 0.94, b: 0.97 }
+  }
+  var blue = themeAnchor(colors, "blue", bg, fixed.blue)
+  var cyan = themeAnchor(colors, "cyan", bg, fixed.cyan)
+  var magenta = themeAnchor(colors, "magenta", bg, fixed.magenta)
+  var red = themeAnchor(colors, "red", bg, fixed.red)
+  var yellow = themeAnchor(colors, "yellow", bg, fixed.yellow)
+  var white = themeAnchor(colors, "white", bg, fixed.white)
+  return {
+    near: [
+      [-18, bg],
+      [-12, darkenRgb(lerpRgb(bg, magenta, 0.18), 0.10)],
+      [-6, lerpRgb(bg, red, 0.35)],
+      [-3, lerpRgb(red, magenta, 0.20)],
+      [0, lerpRgb(yellow, red, 0.28)],
+      [3, lerpRgb(yellow, white, 0.20)],
+      [8, lerpRgb(yellow, cyan, 0.35)],
+      [15, lerpRgb(cyan, white, 0.55)],
+      [30, lerpRgb(cyan, white, 0.72)],
+      [90, lerpRgb(cyan, white, 0.82)]
+    ],
+    far: [
+      [-18, bg],
+      [-12, darkenRgb(lerpRgb(bg, magenta, 0.14), 0.12)],
+      [-6, lerpRgb(bg, magenta, 0.30)],
+      [-3, lerpRgb(magenta, red, 0.30)],
+      [0, lerpRgb(red, magenta, 0.30)],
+      [3, lerpRgb(red, cyan, 0.25)],
+      [8, lerpRgb(magenta, cyan, 0.40)],
+      [15, lerpRgb(blue, white, 0.52)],
+      [30, lerpRgb(blue, white, 0.70)],
+      [90, lerpRgb(blue, white, 0.80)]
+    ],
+    zenith: [
+      [-18, bg],
+      [-12, darkenRgb(lerpRgb(bg, blue, 0.10), 0.14)],
+      [-6, darkenRgb(lerpRgb(bg, blue, 0.18), 0.08)],
+      [-3, lerpRgb(bg, magenta, 0.22)],
+      [0, lerpRgb(magenta, blue, 0.32)],
+      [3, lerpRgb(magenta, blue, 0.48)],
+      [8, lerpRgb(blue, cyan, 0.22)],
+      [15, lerpRgb(blue, cyan, 0.45)],
+      [30, lerpRgb(blue, white, 0.48)],
+      [90, lerpRgb(blue, white, 0.62)]
+    ],
+    sun: lerpRgb(yellow, white, 0.35),
+    sunTwilight: lerpRgb(blue, white, 0.45)
+  }
+}
+
+function skyColorAt(stops, elev) {
+  if (!stops || stops.length === 0) return { r: 0, g: 0, b: 0 }
+  if (elev <= stops[0][0]) return stops[0][1]
+  for (var i = 1; i < stops.length; i++) {
+    if (elev <= stops[i][0]) {
+      var t = (elev - stops[i - 1][0]) / (stops[i][0] - stops[i - 1][0])
+      return lerpRgb(stops[i - 1][1], stops[i][1], t)
+    }
+  }
+  return stops[stops.length - 1][1]
+}
+
+function cssRgba(c, a) {
+  return "rgba(" + Math.round(c.r * 255) + "," + Math.round(c.g * 255) + "," + Math.round(c.b * 255) + "," + a + ")"
+}
+
+// Axis helpers for the tide chart: a round step for the height axis, and
+// the local hours in a span that fall on a multiple of `every`.
+function niceStep(range) {
+  if (range <= 0) return 1
+  var raw = range / 3
+  var mag = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10))
+  var norm = raw / mag
+  var step = norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10
+  return step * mag
+}
+
+function hourTicks(t0Ms, t1Ms, every) {
+  var out = []
+  var d = new Date(t0Ms)
+  d.setMinutes(0, 0, 0)
+  d.setHours(d.getHours() + 1)
+  while (d.getTime() <= t1Ms) {
+    var h = d.getHours()
+    if (h % every === 0) out.push({ ms: d.getTime(), label: clock24 ? (h < 10 ? "0" : "") + h : (h % 12 === 0 ? 12 : h % 12) + (h < 12 ? "a" : "p") })
+    d.setHours(d.getHours() + 1)
+  }
+  return out
+}
+
+// A clock label for a millisecond timestamp, in the same style.
+function clockLabelMs(ms) {
+  var d = new Date(ms)
+  var h = d.getHours()
+  var mm = (d.getMinutes() < 10 ? "0" : "") + d.getMinutes()
+  if (clock24) return (h < 10 ? "0" : "") + h + ":" + mm
+  return (h % 12 === 0 ? 12 : h % 12) + ":" + mm + (h < 12 ? "a" : "p")
+}
+
+// "" for today, "tmrw" for tomorrow, else the short weekday.
+function dayTag(isoTime, nowMs) {
+  var t = parseIsoLocal(isoTime)
+  if (isNaN(t)) return ""
+  var a = new Date(t); a.setHours(0, 0, 0, 0)
+  var b = new Date(nowMs); b.setHours(0, 0, 0, 0)
+  var days = Math.round((a.getTime() - b.getTime()) / 86400000)
+  if (days <= 0) return ""
+  if (days === 1) return "tmrw"
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][a.getDay()]
 }

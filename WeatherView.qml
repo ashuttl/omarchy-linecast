@@ -48,13 +48,81 @@ Item {
 
   readonly property var recentLocations: recents.entries
 
+  // Whether `linecast` is on PATH; checked each time the panel opens
+  // without data, so an install shows up without a restart.
+  property bool linecastMissing: false
+
+  Process {
+    id: whichProc
+    command: ["bash", "-lc", "command -v linecast >/dev/null 2>&1 && echo yes || echo no"]
+    stdout: StdioCollector {
+      onStreamFinished: view.linecastMissing = text.trim() === "no"
+    }
+  }
+
+  Process {
+    id: installProc
+    command: ["bash", (view.host ? view.host.pluginDir : "") + "scripts/linecast-install.sh"]
+    onExited: {
+      whichProc.running = true
+      feed.refresh()
+      if (view.host && view.host.hostWidget && typeof view.host.hostWidget.refresh === "function")
+        view.host.hostWidget.refresh()
+    }
+  }
+
+  // ---- Which pills ride in the bar. Weather stays; the rest are the
+  //      user's call, in the canonical order.
+  readonly property var pillChoices: [
+    { name: "weather", label: "Weather", icon: "󰖐" },
+    { name: "sunshine", label: "Sunshine", icon: "󰖜" },
+    { name: "moon", label: "Moon", icon: "󰽥" },
+    { name: "tides", label: "Tides", icon: "󰔍" }
+  ]
+  readonly property var pillsShown: view.host && view.host.hostWidget ? view.host.hostWidget.pillOrder : []
+  readonly property bool pillsAlwaysOut: !!(view.host && view.host.settings && view.host.settings.alwaysShow === true)
+
+  function pillShown(name) { return view.pillsShown.indexOf(name) !== -1 }
+
+  property bool unitsBusy: false
+  Process {
+    id: unitsProc
+    onExited: {
+      view.unitsBusy = false
+      // Same fan-out as a location change: every face refetches and the
+      // pills rerun now rather than on their own schedule.
+      view.locationChangedByUser()
+    }
+  }
+
+  function setUnits(key) {
+    if (view.unitsBusy) return
+    view.unitsBusy = true
+    unitsProc.command = ["bash", "-lc", "linecast units " + key + " >/dev/null 2>&1"]
+    unitsProc.running = true
+  }
+
+  function togglePill(name) {
+    if (!view.host || name === "weather") return
+    var next = []
+    for (var i = 0; i < view.pillChoices.length; i++) {
+      var n = view.pillChoices[i].name
+      var on = view.pillShown(n)
+      if (n === name) on = !on
+      if (on) next.push(n)
+    }
+    view.host.persistSettings({ pills: next })
+  }
+
   property bool locMenuOpen: false
 
   function refresh() { feed.refresh() }
 
   onShownChanged: {
-    if (shown) feed.refreshIfStale()
-    else view.locMenuOpen = false
+    if (shown) {
+      feed.refreshIfStale()
+      if (!feed.payload) whichProc.running = true
+    } else view.locMenuOpen = false
   }
   // A theme swap flows into the declarative bindings on its own, but the
   // canvas reads its colors and font imperatively in onPaint — nudge it.
@@ -156,17 +224,37 @@ Item {
     width: parent.width
     spacing: Style.space(10)
 
-    Text {
+    // ---- Nothing yet: fetching, or no linecast to fetch with.
+    Column {
       visible: !view.payload
       width: parent.width
-      horizontalAlignment: Text.AlignHCenter
-      topPadding: Style.space(24)
-      bottomPadding: Style.space(24)
-      text: feed.fetching ? "Fetching weather…" : "No weather data — is linecast ≥ 1.9 installed?"
-      wrapMode: Text.WordWrap
-      color: view.muted
-      font.family: view.fontFamily
-      font.pixelSize: Style.font.body
+      spacing: Style.space(12)
+      topPadding: Style.space(16)
+      bottomPadding: Style.space(8)
+
+      Text {
+        width: parent.width
+        horizontalAlignment: Text.AlignHCenter
+        text: view.linecastMissing
+          ? "This widget draws on linecast, the terminal weather, sun, moon, tide, radar, and map suite. It isn't installed yet."
+          : (feed.fetching ? "Fetching weather…" : "No weather data yet — try r to refetch.")
+        wrapMode: Text.WordWrap
+        color: view.muted
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Button {
+        visible: view.linecastMissing
+        anchors.horizontalCenter: parent.horizontalCenter
+        iconText: "󰏔"
+        text: installProc.running ? "Installing…" : "Install linecast"
+        tooltipText: "From the AUR with yay, or with uv"
+        bordered: true
+        foreground: view.foreground
+        fontFamily: view.fontFamily
+        onClicked: if (!installProc.running) installProc.running = true
+      }
     }
 
     // ---- Header: the place leads, and is the location menu's trigger.
@@ -860,6 +948,159 @@ Item {
             ? String(Math.round(view.hourly[0].uv_index)) : ""
           foreground: view.foreground
           fontFamily: view.fontFamily
+        }
+      }
+    }
+
+    PanelSeparator { visible: !!view.current; foreground: view.foreground }
+
+    // ---- The bar: which of linecast's pills ride in it.
+    Column {
+      visible: !!view.current
+      width: parent.width
+      spacing: Style.space(6)
+
+      Text {
+        text: "PILLS IN THE BAR"
+        color: view.muted
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1.2
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Repeater {
+          model: view.pillChoices
+
+          Button {
+            required property var modelData
+            width: (parent.width - Style.space(6) * 3) / 4
+            iconText: modelData.icon
+            text: modelData.label
+            fontSize: Style.font.bodySmall
+            bordered: true
+            selected: view.pillShown(modelData.name)
+            tooltipText: modelData.name === "weather" ? "Always in the bar" : (view.pillShown(modelData.name) ? "Take it off the bar" : "Put it on the bar")
+            foreground: view.foreground
+            fontFamily: view.fontFamily
+            onClicked: view.togglePill(modelData.name)
+          }
+        }
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+
+        ToggleSwitch {
+          id: alwaysOutSwitch
+          anchors.verticalCenter: parent.verticalCenter
+          checked: view.pillsAlwaysOut
+          foreground: view.foreground
+          onToggled: if (view.host) view.host.persistSettings({ alwaysShow: !view.pillsAlwaysOut })
+        }
+
+        Text {
+          anchors.verticalCenter: parent.verticalCenter
+          text: view.pillsAlwaysOut ? "Every pill stays out" : "Extra pills slide out on hover"
+          color: view.muted
+          font.family: view.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+    }
+
+    // ---- Units and the clock. Units are linecast's own setting, so the
+    //      pills, the panels, and the terminal views all agree.
+    Row {
+      visible: !!view.current
+      width: parent.width
+      spacing: Style.space(6)
+
+      Repeater {
+        model: [
+          { key: "imperial", label: "°F", tip: "Fahrenheit, mph, inches, feet" },
+          { key: "metric", label: "°C", tip: "Celsius, km/h, mm, metres" }
+        ]
+
+        Button {
+          required property var modelData
+          width: (parent.width - Style.space(6) * 3) / 4
+          text: modelData.label
+          tooltipText: modelData.tip
+          fontSize: Style.font.bodySmall
+          bordered: true
+          selected: (view.tempUnit === "°C") === (modelData.key === "metric")
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+          onClicked: view.setUnits(modelData.key)
+        }
+      }
+
+      Repeater {
+        model: [
+          { key: "24h", label: "24h" },
+          { key: "12h", label: "12h" }
+        ]
+
+        Button {
+          required property var modelData
+          width: (parent.width - Style.space(6) * 3) / 4
+          text: modelData.label
+          fontSize: Style.font.bodySmall
+          bordered: true
+          selected: (view.host && view.host.settings && view.host.settings.clock === "12h") === (modelData.key === "12h")
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+          onClicked: if (view.host) { view.host.persistSettings({ clock: modelData.key }); hourlyChart.requestPaint() }
+        }
+      }
+    }
+
+    PanelSeparator { visible: !!view.current; foreground: view.foreground }
+
+    // ---- linecast itself, in a terminal.
+    Column {
+      visible: !!view.current
+      width: parent.width
+      spacing: Style.space(6)
+
+      Text {
+        text: "IN THE TERMINAL"
+        color: view.muted
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1.2
+      }
+
+      Row {
+        width: parent.width
+        spacing: Style.space(6)
+
+        Repeater {
+          model: [
+            { name: "radar", label: "Radar", icon: "󰼯", tip: "Live precipitation radar, animated" },
+            { name: "maps", label: "Maps", icon: "󰍎", tip: "Terrain, streets, and the globe" },
+            { name: "weather", label: "Weather", icon: "󰆍", tip: "The full forecast, live" }
+          ]
+
+          Button {
+            required property var modelData
+            width: (parent.width - Style.space(6) * 2) / 3
+            iconText: modelData.icon
+            text: modelData.label
+            tooltipText: modelData.tip
+            fontSize: Style.font.bodySmall
+            bordered: true
+            foreground: view.foreground
+            fontFamily: view.fontFamily
+            onClicked: if (view.host) view.host.launch(modelData.name)
+          }
         }
       }
     }

@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Model.js" as Model
 
 // The linecast popup: one panel, four faces. Whichever pill was clicked
 // picks the section and the anchor, so the popup drops from the weather,
@@ -44,13 +45,35 @@ Panel {
     if (activeView && activeView.refresh) activeView.refresh()
   }
 
-  // No write-back into shell.json. The stock panels persist through
-  // shell.updateEntryInline, which keys on the plugin id and so writes the
-  // same settings object onto every layout entry carrying it — fine for a
-  // single-instance widget, destructive here, where each Linecast entry
-  // holds its own `pills`. The one thing a panel wants to save is the
-  // location picker's recents, and those are shared state that belongs in a
-  // file: see RecentLocations.qml.
+  // The widget's shell.json entry, handed down by BarWidget.injectPanel.
+  // Written back through the shell like the stock panels do; the write is
+  // keyed on the plugin id, which is one widget per plugin here.
+  property var settings: ({})
+  onSettingsChanged: Model.setClock24(!(settings && settings.clock === "12h"))
+  Component.onCompleted: Model.setClock24(!(settings && settings.clock === "12h"))
+
+  readonly property string pluginDir: {
+    var url = Qt.resolvedUrl(".").toString()
+    return url.indexOf("file://") === 0 ? url.substring(7) : url
+  }
+
+  // Applied to the host widget first so the bar redraws on the click; the
+  // shell.json write comes back through the bar as the same value.
+  function persistSettings(values) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    for (var key in values) entry[key] = values[key]
+    root.settings = entry
+    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  // Float one of linecast's views in a terminal: weather, sunshine, moon,
+  // tides, radar, or maps.
+  function launch(name) {
+    if (root.bar) root.bar.run(root.pluginDir + "scripts/linecast-toggle.sh " + name)
+  }
 
   function open() {
     root.controller.show()
