@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "ashuttl.linecast",
   "name": "Linecast",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "author": "Andrew Shuttleworth",
   "license": "MIT",
-  "description": "Weather, sun, moon, and tide pills from linecast, each with an anchored panel",
+  "description": "Weather, sun, moon, and tide pills from linecast, each opening a panel drawn in the theme",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Linecast",
-    "description": "Weather, sunshine, moon, and tide pills with anchored panels — install the companion plugins to place each pill separately",
+    "description": "Weather, sunshine, moon, and tide pills with anchored panels; pick which pills show from the weather panel",
     "category": "Weather",
     "allowMultiple": false,
     "schema": [
@@ -55,6 +55,23 @@
         "label": "Always Show",
         "description": "Keep every pill out instead of sliding the extras in on hover.",
         "defaultValue": false
+      },
+      {
+        "key": "clock",
+        "type": "select",
+        "label": "Clock",
+        "description": "24-hour or 12-hour times in the panels and pills.",
+        "defaultValue": "24h",
+        "options": [
+          {
+            "value": "24h",
+            "label": "24-hour"
+          },
+          {
+            "value": "12h",
+            "label": "12-hour"
+          }
+        ]
       }
     ]
   }

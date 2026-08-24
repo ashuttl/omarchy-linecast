@@ -260,13 +260,11 @@ Item {
         ctx.lineTo(w, horizonY + 0.5)
         ctx.stroke()
 
-        // The arc, dotted like the braille one: dim below the horizon,
-        // brighter across the sky.
-        function dottedSpan(from, to, color) {
+        // The arc: dim below the horizon, brighter across the sky.
+        function strokeSpan(from, to, color) {
           ctx.strokeStyle = color
           ctx.lineWidth = 2
           ctx.lineCap = "round"
-          ctx.setLineDash([0.5, 4])
           ctx.beginPath()
           var steps = 80
           for (var i = 0; i <= steps; i++) {
@@ -275,11 +273,10 @@ Item {
             else ctx.lineTo(xFor(t), yFor(t))
           }
           ctx.stroke()
-          ctx.setLineDash([])
         }
-        dottedSpan(t0, rise, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
-        dottedSpan(set, t1, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
-        dottedSpan(rise, set, Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.75))
+        strokeSpan(t0, rise, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
+        strokeSpan(set, t1, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
+        strokeSpan(rise, set, Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.75))
 
         // While scrubbing, a small mark keeps now on the arc.
         if (view.scrubbing && now >= t0 && now <= t1) {

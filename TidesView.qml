@@ -206,8 +206,8 @@ Item {
         fillSpan(0, nowX, 0.05)
         fillSpan(nowX, plotW, 0.13)
 
-        // The curve, dotted like the braille one; the past dimmed.
-        function dottedSpan(fromX, toX, color) {
+        // The curve, the past dimmed.
+        function strokeSpan(fromX, toX, color) {
           if (toX <= fromX) return
           ctx.save()
           ctx.beginPath()
@@ -216,7 +216,6 @@ Item {
           ctx.strokeStyle = color
           ctx.lineWidth = 2
           ctx.lineCap = "round"
-          ctx.setLineDash([0.5, 4])
           ctx.beginPath()
           for (var i = 0; i < pts.length; i++) {
             var x = xFor(Model.parseIsoLocal(pts[i].time))
@@ -225,11 +224,10 @@ Item {
             else ctx.lineTo(x, y)
           }
           ctx.stroke()
-          ctx.setLineDash([])
           ctx.restore()
         }
-        dottedSpan(0, nowX, dim)
-        dottedSpan(nowX, plotW, fg)
+        strokeSpan(0, nowX, dim)
+        strokeSpan(nowX, plotW, fg)
 
         // Hours along the bottom.
         ctx.font = caption

@@ -2,6 +2,15 @@
 # Omarchy bar module: countdown to the next sunrise/sunset, from `linecast sunshine`.
 # The oneline output is cached for 30 min; the countdown is computed locally.
 
+
+# The bar keeps a 24-hour clock unless the widget's clock setting says
+# 12h; linecast's oneline output is 12-hour in English, so convert here.
+clock_fix() {
+  if [[ "${PILL_CLOCK:-24h}" == "12h" ]]; then cat; else
+    perl -pe 's/\b(\d{1,2}):(\d{2})([ap])\b/sprintf("%02d:%s", ($1 % 12) + ($3 eq "p" ? 12 : 0), $2)/ge'
+  fi
+}
+
 cache="$HOME/.cache/omarchy-bar-sunshine-oneline"
 config="$HOME/.config/linecast/config.json"
 max_age=1800
@@ -43,4 +52,4 @@ fi
 
 jq -cn --arg text "$icon $until_str" \
   --arg tooltip "$event in $until_str — $line" \
-  '{text: $text, tooltip: $tooltip}'
+  '{text: $text, tooltip: $tooltip}' | clock_fix

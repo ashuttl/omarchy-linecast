@@ -3,6 +3,15 @@
 # The oneline output is cached for 30 min. Collapses quietly when the
 # location has no tide station within range (inland travel, no network).
 
+
+# The bar keeps a 24-hour clock unless the widget's clock setting says
+# 12h; linecast's oneline output is 12-hour in English, so convert here.
+clock_fix() {
+  if [[ "${PILL_CLOCK:-24h}" == "12h" ]]; then cat; else
+    perl -pe 's/\b(\d{1,2}):(\d{2})([ap])\b/sprintf("%02d:%s", ($1 % 12) + ($3 eq "p" ? 12 : 0), $2)/ge'
+  fi
+}
+
 cache="$HOME/.cache/omarchy-bar-tides-oneline"
 config="$HOME/.config/linecast/config.json"
 max_age=1800
@@ -32,4 +41,4 @@ if [[ ! "$line" =~ ([▲▼])[^\ ]*\ ([0-9]+:[0-9]+[ap]) ]]; then
 fi
 
 jq -cn --arg text "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" --arg tooltip "$line" \
-  '{text: $text, tooltip: $tooltip}'
+  '{text: $text, tooltip: $tooltip}' | clock_fix

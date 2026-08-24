@@ -2,6 +2,15 @@
 # Omarchy bar module: moon phase icon + next rise/set event, from `linecast moon`.
 # Pure local astronomy (no network), but cache anyway to keep the bar cheap.
 
+
+# The bar keeps a 24-hour clock unless the widget's clock setting says
+# 12h; linecast's oneline output is 12-hour in English, so convert here.
+clock_fix() {
+  if [[ "${PILL_CLOCK:-24h}" == "12h" ]]; then cat; else
+    perl -pe 's/\b(\d{1,2}):(\d{2})([ap])\b/sprintf("%02d:%s", ($1 % 12) + ($3 eq "p" ? 12 : 0), $2)/ge'
+  fi
+}
+
 cache="$HOME/.cache/omarchy-bar-moon-oneline"
 config="$HOME/.config/linecast/config.json"
 max_age=900
@@ -31,4 +40,4 @@ else
 fi
 
 jq -cn --arg text "$text" --arg tooltip "$line" \
-  '{text: $text, tooltip: $tooltip}'
+  '{text: $text, tooltip: $tooltip}' | clock_fix
