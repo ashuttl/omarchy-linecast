@@ -1,10 +1,11 @@
 # omarchy-linecast
 
-An [Omarchy](https://omarchy.org) bar-widget plugin for
+An [Omarchy](https://omarchy.org) bar-widget plugin built on
 [linecast](https://github.com/ashuttl/linecast) — weather, the sun, the
-moon, and the tides, drawn for the terminal. The bar gets a pill for each;
-every pill opens a panel that matches the stock ones and re-inks itself
-when you switch themes.
+moon, the tides, radar, and maps, drawn for the terminal. The bar gets a
+pill for each of the first four; every pill opens a panel that matches the
+stock ones and re-inks itself when you switch themes. linecast itself
+comes bundled, so there is nothing else to install.
 
 ![preview](preview.png)
 
@@ -41,12 +42,13 @@ change together when you switch themes.
 
 ## Requirements
 
-- [linecast](https://github.com/ashuttl/linecast) 1.9 or newer. On
-  Omarchy it's in the AUR: `yay -S linecast`. Or, with uv:
-  `uv tool install linecast`. If it's missing, the weather panel offers
-  to install it.
-- A Nerd Font in the bar (Omarchy's default) for the weather glyphs.
-- `jq`, which Omarchy already ships.
+Nothing beyond a stock Omarchy. The plugin carries its own copy of
+linecast (`vendor/linecast`, v1.15.1, MIT, same author) and runs it with
+the system Python — linecast has no dependencies outside the standard
+library. If you have linecast installed already, from the AUR
+(`yay -S linecast`) or with `uv tool install linecast`, the plugin uses
+yours instead, so the bar and your terminal always agree. `jq` and a Nerd
+Font in the bar are part of Omarchy.
 
 ## Install
 
@@ -66,11 +68,13 @@ omarchy bar move ashuttl.linecast --section center
 omarchy plugin remove ashuttl.linecast
 ```
 
-That takes the widget off the bar and deletes the plugin. It leaves
-linecast installed (`yay -R linecast` or `uv tool uninstall linecast`
-if you want it gone too), and a few small files you can delete by hand:
-the pill caches at `~/.cache/omarchy-bar-*-oneline` and the location
-recents at `~/.local/state/omarchy/linecast-recent-locations.json`.
+That takes the widget off the bar and deletes the plugin, bundled
+linecast included. A few small files are left for you to delete by hand
+if you like: the pill caches at `~/.cache/omarchy-bar-*-oneline`, the
+plugin's compiled Python at `~/.cache/omarchy-linecast/`, the location
+recents at `~/.local/state/omarchy/linecast-recent-locations.json`, and
+linecast's own settings and caches at `~/.config/linecast/` and
+`~/.cache/linecast/`. A linecast you installed yourself stays put.
 
 ## Settings
 
@@ -109,11 +113,16 @@ omarchy-shell shell toggle ashuttl.linecast        # last-used face
 
 ## Notes
 
-The pills shell out to `scripts/linecast-*.sh`, which cache linecast's
-`--oneline` output under `~/.cache/`; each panel runs its
-`linecast <command> --json` on first open and refetches when stale. Nothing
-here talks to the network directly — linecast does, to Open-Meteo, NOAA,
-and the other sources it documents.
+Everything runs through `bin/linecast`, a small wrapper that picks an
+installed linecast when one is on `PATH` and the bundled tree otherwise
+(`bin/linecast --source` tells you which). The pills shell out to
+`scripts/linecast-*.sh`, which cache linecast's `--oneline` output under
+`~/.cache/`; each panel runs its `linecast <command> --json` on first open
+and refetches when stale. Nothing here talks to the network directly —
+linecast does, to Open-Meteo, NOAA, and the other sources it documents.
+
+`scripts/vendor.sh v1.15.1` refreshes the bundled copy from a linecast
+tag.
 
 ## License
 

@@ -13,6 +13,7 @@ Item {
 
   property var bar
   property bool shown: false
+  property var host: null
   property int locationEpoch: 0
   // ThemePalette from the panel; null falls back to fixed colors.
   property var palette: null
@@ -126,7 +127,7 @@ Item {
 
   JsonFeed {
     id: feed
-    command: "linecast sunshine --json"
+    command: (view.host ? view.host.linecastBin : "linecast") + " sunshine --json"
     staleAfterMs: 30 * 60 * 1000
     onPayloadChanged: arc.requestPaint()
   }

@@ -48,26 +48,16 @@ Item {
 
   readonly property var recentLocations: recents.entries
 
-  // Whether `linecast` is on PATH; checked each time the panel opens
-  // without data, so an install shows up without a restart.
-  property bool linecastMissing: false
+  readonly property string linecastBin: view.host ? view.host.linecastBin : "linecast"
 
+  // Whether the plugin is running its bundled linecast or one the user
+  // installed; decides the note under the terminal buttons.
+  property string linecastSource: ""
   Process {
-    id: whichProc
-    command: ["bash", "-lc", "command -v linecast >/dev/null 2>&1 && echo yes || echo no"]
+    id: sourceProc
+    command: ["bash", "-lc", view.linecastBin + " --source"]
     stdout: StdioCollector {
-      onStreamFinished: view.linecastMissing = text.trim() === "no"
-    }
-  }
-
-  Process {
-    id: installProc
-    command: ["bash", (view.host ? view.host.pluginDir : "") + "scripts/linecast-install.sh"]
-    onExited: {
-      whichProc.running = true
-      feed.refresh()
-      if (view.host && view.host.hostWidget && typeof view.host.hostWidget.refresh === "function")
-        view.host.hostWidget.refresh()
+      onStreamFinished: view.linecastSource = text.trim()
     }
   }
 
@@ -106,7 +96,7 @@ Item {
   function setUnits(key) {
     if (view.unitsBusy) return
     view.unitsBusy = true
-    unitsProc.command = ["bash", "-lc", "linecast units " + key + " >/dev/null 2>&1"]
+    unitsProc.command = ["bash", "-lc", view.linecastBin + " units " + key + " >/dev/null 2>&1"]
     unitsProc.running = true
   }
 
@@ -129,7 +119,7 @@ Item {
   onShownChanged: {
     if (shown) {
       feed.refreshIfStale()
-      if (!feed.payload) whichProc.running = true
+      if (view.linecastSource === "") sourceProc.running = true
     } else view.locMenuOpen = false
   }
   // A theme swap flows into the declarative bindings on its own, but the
@@ -147,7 +137,7 @@ Item {
 
   JsonFeed {
     id: feed
-    command: "linecast weather --json" + (view.host ? view.host.tempFlag : "")
+    command: (view.host ? view.host.linecastBin : "linecast") + " weather --json" + (view.host ? view.host.tempFlag : "")
     onPayloadChanged: hourlyChart.requestPaint()
   }
 
@@ -188,7 +178,7 @@ Item {
 
   function searchLocations(query) {
     if (String(query).trim() === "") return
-    runLoc("linecast location search " + shq(query) + " 2>/dev/null", function(out) {
+    runLoc(view.linecastBin + " location search " + shq(query) + " 2>/dev/null", function(out) {
       var rows = []
       var lines = String(out).split("\n")
       for (var i = 0; i < lines.length && rows.length < 5; i++) {
@@ -210,7 +200,7 @@ Item {
   }
 
   function applyLocation(entry) {
-    runLoc("linecast location set " + shq(entry.query) + " >/dev/null 2>&1; echo done", function() {
+    runLoc(view.linecastBin + " location set " + shq(entry.query) + " >/dev/null 2>&1; echo done", function() {
       rememberLocation(entry)
       view.searchResults = []
       searchField.text = ""
@@ -220,7 +210,7 @@ Item {
   }
 
   function applyAutoLocation() {
-    runLoc("linecast location auto >/dev/null 2>&1; echo done", function() {
+    runLoc(view.linecastBin + " location auto >/dev/null 2>&1; echo done", function() {
       view.searchResults = []
       view.locMenuOpen = false
       view.locationChangedByUser()
@@ -232,37 +222,17 @@ Item {
     width: parent.width
     spacing: Style.space(10)
 
-    // ---- Nothing yet: fetching, or no linecast to fetch with.
-    Column {
+    Text {
       visible: !view.payload
       width: parent.width
-      spacing: Style.space(12)
-      topPadding: Style.space(16)
-      bottomPadding: Style.space(8)
-
-      Text {
-        width: parent.width
-        horizontalAlignment: Text.AlignHCenter
-        text: view.linecastMissing
-          ? "This widget draws on linecast, the terminal weather, sun, moon, tide, radar, and map suite. It isn't installed yet."
-          : (feed.fetching ? "Fetching weather…" : "No weather data yet — try r to refetch.")
-        wrapMode: Text.WordWrap
-        color: view.muted
-        font.family: view.fontFamily
-        font.pixelSize: Style.font.body
-      }
-
-      Button {
-        visible: view.linecastMissing
-        anchors.horizontalCenter: parent.horizontalCenter
-        iconText: "󰏔"
-        text: installProc.running ? "Installing…" : "Install linecast"
-        tooltipText: "From the AUR with yay, or with uv"
-        bordered: true
-        foreground: view.foreground
-        fontFamily: view.fontFamily
-        onClicked: if (!installProc.running) installProc.running = true
-      }
+      horizontalAlignment: Text.AlignHCenter
+      topPadding: Style.space(24)
+      bottomPadding: Style.space(24)
+      text: feed.fetching ? "Fetching weather…" : "No weather data yet — press r to refetch."
+      wrapMode: Text.WordWrap
+      color: view.muted
+      font.family: view.fontFamily
+      font.pixelSize: Style.font.body
     }
 
     // ---- Header: the place leads, and is the location menu's trigger.
@@ -1134,6 +1104,17 @@ Item {
             onClicked: if (view.host) view.host.launch(modelData.name)
           }
         }
+      }
+
+      Text {
+        width: parent.width
+        text: view.linecastSource === "installed"
+          ? "Running your installed linecast."
+          : "Running the bundled linecast. For your own terminal too:  yay -S linecast"
+        wrapMode: Text.WordWrap
+        color: view.muted
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.caption
       }
     }
   }

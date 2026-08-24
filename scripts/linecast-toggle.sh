@@ -5,6 +5,7 @@
 
 name="$1"
 class="org.omarchy.linecast-$name"
+linecast="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/linecast"
 
 case "$name" in
   radar | maps) size="1280 820" ;;
@@ -25,7 +26,7 @@ fi
 
 flags=""
 [[ "$name" == weather ]] && flags="${LINECAST_TEMP:-}"
-cmd="xdg-terminal-exec --app-id=$class --title=${name^} -e linecast $name $flags"
+cmd="xdg-terminal-exec --app-id=$class --title=${name^} -e $linecast $name $flags"
 rules="[float; size $size; center]"
 
 # Hyprland 0.56+ takes dispatches as Lua; older releases keep the plain form.

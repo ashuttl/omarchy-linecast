@@ -13,6 +13,7 @@ Item {
 
   property var bar
   property bool shown: false
+  property var host: null
   property int locationEpoch: 0
 
   readonly property int panelWidth: Style.space(320)
@@ -37,7 +38,7 @@ Item {
 
   JsonFeed {
     id: feed
-    command: "linecast moon --json"
+    command: (view.host ? view.host.linecastBin : "linecast") + " moon --json"
     staleAfterMs: 30 * 60 * 1000
   }
 

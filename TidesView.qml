@@ -14,6 +14,7 @@ Item {
 
   property var bar
   property bool shown: false
+  property var host: null
   property int locationEpoch: 0
 
   readonly property int panelWidth: Style.space(380)
@@ -84,7 +85,7 @@ Item {
 
   JsonFeed {
     id: feed
-    command: "linecast tides --json"
+    command: (view.host ? view.host.linecastBin : "linecast") + " tides --json"
     staleAfterMs: 30 * 60 * 1000
     onPayloadChanged: chart.requestPaint()
   }

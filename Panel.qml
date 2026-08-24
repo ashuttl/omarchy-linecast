@@ -56,6 +56,9 @@ Panel {
     var url = Qt.resolvedUrl(".").toString()
     return url.indexOf("file://") === 0 ? url.substring(7) : url
   }
+  // bin/linecast runs an installed linecast when there is one, and the
+  // bundled copy under vendor/ otherwise — see README.
+  readonly property string linecastBin: pluginDir + "bin/linecast"
 
   // Applied to the host widget first so the bar redraws on the click; the
   // shell.json write comes back through the bar as the same value.
@@ -170,6 +173,7 @@ Panel {
         id: sunshineView
         width: parent.width
         bar: root.bar
+        host: root
         palette: root.themePalette
         locationEpoch: root.locationEpoch
         visible: root.section === "sunshine"
@@ -180,6 +184,7 @@ Panel {
         id: moonView
         width: parent.width
         bar: root.bar
+        host: root
         locationEpoch: root.locationEpoch
         visible: root.section === "moon"
         shown: visible && root.opened
@@ -189,6 +194,7 @@ Panel {
         id: tidesView
         width: parent.width
         bar: root.bar
+        host: root
         locationEpoch: root.locationEpoch
         visible: root.section === "tides"
         shown: visible && root.opened

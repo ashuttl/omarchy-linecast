@@ -1,0 +1,22 @@
+#!/bin/bash
+# linecast for the plugin: an installed copy if there is one on PATH,
+# otherwise the bundled source tree under ../vendor, run with the system
+# Python (linecast has no dependencies beyond the standard library).
+#
+#   bin/linecast --source   prints "installed" or "bundled" and exits.
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Look past ourselves for a real install.
+real=$(PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx "$here" | paste -sd:) command -v linecast 2>/dev/null || true)
+
+if [[ "${1:-}" == "--source" ]]; then
+  [[ -n "$real" ]] && echo installed || echo bundled
+  exit 0
+fi
+
+[[ -n "$real" ]] && exec "$real" "$@"
+
+export PYTHONPATH="$here/../vendor${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPYCACHEPREFIX="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-linecast/pycache"
+exec python3 -m linecast "$@"

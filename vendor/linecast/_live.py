@@ -1,0 +1,616 @@
+"""Live mode: alternate screen rendering with auto-refresh and input handling.
+
+Provides the live_loop() function that runs a render callback in a loop on the
+terminal's alternate screen buffer, with support for:
+
+- Auto-refresh on a configurable interval
+- Immediate re-render on terminal resize (SIGWINCH)
+- Re-inking in place when the terminal's colour theme changes
+- Keyboard navigation (arrows, q to quit, n to reset)
+- Mouse wheel scrubbing (SGR and legacy X10/VT200 encoding)
+- Alert modal interaction (click to open, scroll to read, q/click to dismiss)
+
+Mouse protocol references:
+  - SGR (1006): https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Extended-coordinates
+  - Legacy X10:  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Normal-tracking-mode
+"""
+
+import os
+import sys
+import time as _time
+
+
+# ---------------------------------------------------------------------------
+# Mouse decoding
+# ---------------------------------------------------------------------------
+def _decode_sgr_mouse(seq):
+    """Decode an SGR mouse sequence payload like b'<64;10;20M'.
+
+    SGR encoding (mode 1006) sends: CSI < Cb ; Cx ; Cy M/m
+    where M = press, m = release.
+    """
+    if not seq.startswith(b'<') or seq[-1:] not in (b'M', b'm'):
+        return None
+    try:
+        parts = seq[1:-1].decode("ascii").split(";")
+        cb, cx, cy = int(parts[0]), int(parts[1]), int(parts[2])
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return None
+    return ('mouse', cb, cx, cy, seq[-1:] == b'm')
+
+
+def _decode_legacy_mouse(payload):
+    """Decode legacy X10/VT200 mouse payload bytes (Cb, Cx, Cy).
+
+    Legacy encoding sends: CSI M Cb Cx Cy
+    where each byte is the value + 32 (to avoid control characters).
+    """
+    if len(payload) != 3:
+        return None
+    cb = payload[0] - 32
+    cx = payload[1] - 32
+    cy = payload[2] - 32
+    if cb < 0 or cx < 1 or cy < 1:
+        return None
+    is_rel = (cb & 0b11) == 0b11 and not (cb & 0x40)
+    return ('mouse', cb, cx, cy, is_rel)
+
+
+def _normalize_wheel_cb(cb):
+    """Return canonical wheel code 64 (up) / 65 (down), or None.
+
+    Wheel events set bit 6 (0x40). The low two bits encode direction:
+    0 = scroll up, 1 = scroll down. Modifier keys (shift/ctrl/meta) set
+    bits 2–4 but don't change the direction, so we mask them off.
+    """
+    if not (cb & 0x40):
+        return None
+    base = cb & 0b11
+    if base in (0, 1):
+        return 64 + base
+    return None
+
+
+def _read_key(fd, text=False):
+    """Read a keypress from stdin in cbreak mode. Returns action string or None.
+
+    Fully consumes CSI/SS3 escape sequences so leftover bytes don't leak.
+    Uses a longer timeout (150ms) to avoid splitting mouse escape sequences
+    when the system is busy (e.g. after a re-render).
+
+    With text=True (a caller-drawn input field is open), printable input
+    comes back as 'char:<c>' — including multi-byte UTF-8, assembled from
+    continuation bytes — plus 'key:backspace' / 'key:kill' (ctrl-U) /
+    'key:enter' for editing. Escape sequences (arrows, mouse) decode
+    exactly as before, so list navigation keeps working while typing.
+    """
+    import select as _sel
+
+    def _read_byte():
+        try:
+            data = os.read(fd, 1)
+        except OSError:
+            return None
+        return data or None
+
+    def _read_byte_timeout(timeout=0.15):
+        if _sel.select([fd], [], [], timeout)[0]:
+            return _read_byte()
+        return None
+
+    b = _read_byte()
+    if b is None:
+        return None
+
+    if b == b'\033':
+        # Use 150ms timeout — 50ms is too short when the system is busy
+        # rendering; mouse release sequences (\033[<0;x;ym) can arrive late
+        # and the \033 gets read as a bare ESC.
+        b2 = _read_byte_timeout(0.15)
+        if b2 is None:
+            return 'escape'
+
+        if b2 == b']':
+            # An OSC reply to the live loop's theme probe, e.g.
+            # \033]11;rgb:1e/1e/2e\007 (or ST-terminated).  Consume it
+            # whole and hand the body to the theme; it is never a key.
+            body = bytearray()
+            while True:
+                c = _read_byte_timeout(0.15)
+                if c is None:
+                    return None
+                if c == b'\x07':
+                    break
+                if c == b'\033':
+                    _read_byte_timeout(0.05)  # the backslash of ST
+                    break
+                body.extend(c)
+                if len(body) > 256:
+                    return None
+            from linecast import _theme
+            return 'theme' if _theme.ingest_osc(bytes(body)) else None
+
+        if b2 == b'[':
+            seq = bytearray()
+            while True:
+                c = _read_byte_timeout(0.15)
+                if c is None:
+                    break
+                seq.extend(c)
+                # Legacy mouse: \033[M Cb Cx Cy
+                if c == b'M' and len(seq) == 1:
+                    tail = bytearray()
+                    for _ in range(3):
+                        c_tail = _read_byte_timeout(0.15)
+                        if c_tail is None:
+                            return None
+                        tail.extend(c_tail)
+                    return _decode_legacy_mouse(bytes(tail))
+                c0 = c[0]
+                if (65 <= c0 <= 90) or (97 <= c0 <= 122) or c0 == 126:
+                    break
+
+            action = _decode_sgr_mouse(bytes(seq))
+            if action is not None:
+                return action
+
+            final = bytes(seq[-1:]) if seq else b''
+            return {
+                b'A': 'fwd',
+                b'B': 'back',
+                b'C': 'fwd',
+                b'D': 'back',
+            }.get(final)
+
+        if b2 == b'O':
+            # SS3 sequence (some terminals use for arrows)
+            b3 = _read_byte_timeout(0.15)
+            if b3 is not None:
+                return {
+                    b'A': 'fwd',
+                    b'B': 'back',
+                    b'C': 'fwd',
+                    b'D': 'back',
+                }.get(b3)
+        return 'escape'
+
+    if text:
+        # Free-text capture: editing keys first, then any printable
+        # character (assembling UTF-8 continuations), control bytes dropped.
+        if b in (b'\x7f', b'\x08'):
+            return 'key:backspace'
+        if b in (b'\r', b'\n'):
+            return 'key:enter'
+        if b == b'\x15':  # ctrl-U
+            return 'key:kill'
+        o = b[0]
+        if o < 0x20:
+            return None
+        if o < 0x80:
+            return 'char:' + chr(o)
+        if 0xC0 <= o < 0xE0:
+            extra = 1
+        elif 0xE0 <= o < 0xF0:
+            extra = 2
+        elif 0xF0 <= o < 0xF8:
+            extra = 3
+        else:
+            return None  # stray continuation byte or invalid lead
+        buf = bytearray(b)
+        for _ in range(extra):
+            c = _read_byte_timeout(0.05)
+            if c is None:
+                return None
+            buf.extend(c)
+        try:
+            return 'char:' + buf.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+
+    if b in (b'q', b'Q'):
+        return 'quit'
+    if b in (b'o', b'O'):
+        return 'open'
+    if b in (b'n', b'N', b' '):
+        return 'reset'
+    if b in (b'+', b'='):
+        return 'key:+'
+    if b in (b'-', b'_'):
+        return 'key:-'
+    if b in (b't', b'T'):
+        return 'key:t'
+    if b in (b'c', b'C'):
+        return 'key:c'
+    if b in (b'w', b'W'):
+        return 'key:w'
+    if b in (b's', b'S'):
+        return 'key:s'
+    if b in (b'v', b'V'):
+        return 'key:v'
+    if b in (b'p', b'P'):
+        return 'key:p'
+    if b in (b'd', b'D'):
+        return 'key:d'
+    if b in (b'l', b'L'):
+        return 'key:l'
+    if b in (b'r', b'R'):
+        return 'key:r'
+    if b == b'/':
+        return 'key:/'
+    if b == b'?':
+        return 'key:?'
+    if b in (b'\r', b'\n'):
+        return 'key:enter'
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Live loop
+# ---------------------------------------------------------------------------
+def live_loop(render_fn, interval=60, mouse=False, on_open=None, scroll_step=15,
+              auto_play=False, play_interval=0.6, on_action=None, on_drag=None,
+              intercept=None, play_gate=None, on_wheel=None, text_mode=None,
+              on_click=None):
+    """Run render_fn() in a loop on the alternate screen buffer.
+
+    render_fn: callable(offset_minutes=0) returning (display_string, metadata)
+               or just display_string.
+               If mouse=True, also receives mouse_pos=(col, row) or None
+               and active_alert=int_or_None.
+               Scroll/arrow keys adjust offset_minutes to scrub through time.
+    interval: seconds between refreshes.
+    mouse: if True, enable SGR mouse tracking and pass mouse_pos to render_fn.
+    on_open: optional callback(alert_index) called when user presses 'o' on a modal.
+    scroll_step: minutes to advance/retreat per scroll or arrow key event.
+    auto_play: if True, run an animation loop instead of time-scrubbing.
+               render_fn also receives play_frame (monotonic frame counter) and
+               playing (bool). Space toggles play/pause — pausing homes
+               play_frame to 0 (the caller's "home" frame, e.g. the present);
+               scroll/arrows step one frame and pause in place; play_interval
+               sets the frame rate.
+    on_action: optional callback(key) for miscellaneous single-character keys
+               not otherwise handled ('+', '-', 'c', 'w', …). Return a truthy
+               value to trigger an immediate re-render; return falsy to leave
+               the loop waiting as before. Default None preserves existing
+               behavior exactly.
+    on_drag: optional callback(dcol, drow, done) for left-button drags.
+             Fired with the cumulative cell delta from the press position:
+             during the drag with done=False (live preview) and once on
+             release with done=True (commit). Return a truthy value to
+             trigger an immediate re-render. Requires mouse. Default None
+             preserves existing behavior exactly.
+    play_gate: optional callable() consulted before each auto-play frame
+               advance. Return falsy to hold the animation on the current
+               frame (the loop still re-renders every play_interval, so the
+               caller can animate a buffering indicator); return truthy to
+               let playback proceed. Only consulted while auto_play is on
+               and playing. Default None preserves existing behavior.
+    intercept: optional callback(action) consulted for every decoded keyboard
+               action ('fwd', 'quit', 'key:t', …; mouse events excluded)
+               BEFORE the built-in handling. Return truthy to consume the
+               action and trigger a re-render — this is how a caller-drawn
+               menu takes over the arrow keys. Default None preserves
+               existing behavior exactly.
+    on_wheel: optional callback(direction, col, row) for mouse wheel
+              events: +1 up / -1 down, and the pointer's 1-based terminal
+              (col, row) — the same frame as mouse_pos — so the caller
+              can zoom about the pointer rather than the view centre.
+              When set it takes the wheel over entirely (no time-scrub,
+              no frame-step, no modal scroll — the caller decides, e.g.
+              zoom vs panel scroll). Return truthy to re-render; falsy
+              leaves the frame alone (a clamped zoom).
+              Default None preserves existing behavior exactly.
+    text_mode: optional callable() -> bool consulted before each key read.
+               While truthy, printable input arrives at intercept as
+               'char:<c>' plus 'key:backspace'/'key:kill'/'key:enter' —
+               the plumbing for a caller-drawn text field. Escape
+               sequences (arrows, mouse) decode as usual. Default None
+               preserves existing behavior exactly.
+    on_click: optional callback(col, row) for a left click — a press
+              and release on the same cell, in the same 1-based frame
+              as mouse_pos. Fired on the release, before the zero-delta
+              on_drag commit, so a drag is never also a click. Return
+              truthy to re-render. Requires mouse and on_drag (the
+              press is only tracked while a drag callback is set).
+              Default None preserves existing behavior exactly.
+    Re-renders immediately on terminal resize (SIGWINCH) or input.
+
+    While idle, re-probes the terminal's colours now and then (see
+    _theme.poll_interval / watch_path) and repaints when they change,
+    so switching the terminal theme re-inks the view in place.
+    """
+    import select, signal, termios, tty
+    from linecast import _theme
+
+    # Self-pipe for async-signal-safe SIGWINCH wakeup.
+    # threading.Event.set() is NOT safe in signal handlers (its internal
+    # lock can deadlock when SIGWINCH re-enters itself during rapid resize).
+    # os.write() to a pipe is async-signal-safe per POSIX.
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+
+    def _on_winch(*_):
+        try:
+            os.write(wake_w, b'\x00')
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGWINCH, _on_winch)
+
+    # Route SIGTERM/SIGHUP through SystemExit so `pkill radar` or a closed
+    # terminal still runs the finally block below — otherwise the alternate
+    # screen and mouse reporting are left switched on. 128+signum matches
+    # shell convention for signal deaths.
+    def _exit_on_signal(signum, _frame):
+        sys.exit(128 + signum)
+
+    prev_handlers = {}
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            prev_handlers[_sig] = signal.signal(_sig, _exit_on_signal)
+        except (ValueError, OSError):
+            pass
+
+    is_apple_terminal = os.environ.get('TERM_PROGRAM') == 'Apple_Terminal'
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    def _mtime(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+
+    theme_poll = _theme.poll_interval()
+    theme_watch = _theme.watch_path()
+    theme_watch_mtime = _mtime(theme_watch) if theme_watch else None
+    next_probe = _time.monotonic() + theme_poll
+    burst_until = 0.0   # after the watch file changes, probe briskly for a
+                        # few seconds: the terminal may get its colours a
+                        # beat after the marker file is written
+
+    def _maybe_probe():
+        nonlocal theme_watch_mtime, next_probe, burst_until
+        if not _theme.can_reprobe() or _theme.probe_pending():
+            return
+        now = _time.monotonic()
+        if theme_watch:
+            m = _mtime(theme_watch)
+            if m != theme_watch_mtime:
+                theme_watch_mtime = m
+                burst_until = now + 4.0
+                next_probe = now
+        interval = 0.5 if now < burst_until else theme_poll
+        if interval <= 0 and now >= burst_until:
+            return
+        if now >= next_probe:
+            next_probe = now + interval
+            _theme.request_probe(sys.stdout.fileno())
+
+    offset = 0
+    playing = auto_play
+    play_frame = 0
+    mouse_pos = None
+    drag_start = None    # (col, row) of left-button press while on_drag is set
+    active_alert = None  # index of alert whose modal is open, or None
+    modal_scroll = 0     # scroll offset within the modal
+    alert_row_map = {}   # 0-based line index → alert index
+
+    init = "\033[?1049h\033[?25l"
+    if mouse:
+        # Enable both legacy and SGR mouse reporting for broad compatibility.
+        init += "\033[?1000h\033[?1002h\033[?1003h\033[?1006h"
+        # Alternate-scroll mode helps terminals that don't report wheel as mouse.
+        if is_apple_terminal:
+            init += "\033[?1007h"
+    sys.stdout.write(init)
+    sys.stdout.flush()
+    try:
+        tty.setcbreak(fd)
+
+        while True:
+            kwargs = {}
+            if mouse:
+                kwargs.update(mouse_pos=mouse_pos, active_alert=active_alert,
+                              modal_scroll=modal_scroll)
+            if auto_play:
+                kwargs.update(play_frame=play_frame, playing=playing)
+            result = render_fn(offset_minutes=offset, **kwargs)
+            # render_fn may return (output, metadata) or just output
+            if isinstance(result, tuple):
+                output, alert_row_map = result
+            else:
+                output = result
+                alert_row_map = {}
+            # Separate cursor-positioned overlay from main output (\x00 delimiter)
+            parts = output.split('\x00', 1)
+            main_out = parts[0]
+            overlay = parts[1] if len(parts) > 1 else ""
+            # \033[H homes cursor; \033[K clears line remainders;
+            # \033[J clears below; overlay draws on top after clear
+            padded = main_out.replace('\n', '\033[K\n')
+            sys.stdout.write(f"\033[H{padded}\033[K\033[J\033[0m{overlay}\033[0m")
+            sys.stdout.flush()
+            # Drain any pending SIGWINCH notifications.
+            try:
+                os.read(wake_r, 512)
+            except OSError:
+                pass
+
+            # Wait for input, resize, or timeout
+            wait = play_interval if (auto_play and playing) else interval
+            deadline = _time.time() + wait
+            while True:
+                remaining = deadline - _time.time()
+                if remaining <= 0:
+                    if auto_play and playing and (play_gate is None
+                                                  or play_gate()):
+                        play_frame += 1  # advance the animation
+                    break
+                try:
+                    ready, _, _ = select.select([fd, wake_r], [], [], min(0.1, remaining))
+                except (InterruptedError, OSError):
+                    continue
+                if wake_r in ready:
+                    try:
+                        os.read(wake_r, 512)
+                    except OSError:
+                        pass
+                    break
+                if not ready:
+                    _maybe_probe()
+                    continue
+                if fd in ready:
+                    action = _read_key(
+                        fd, text=bool(text_mode is not None and text_mode()))
+                    if action == 'theme':
+                        break  # the terminal's colours changed: repaint
+                    if (intercept is not None and action is not None
+                            and not isinstance(action, tuple)
+                            and intercept(action)):
+                        break
+                    if action == 'quit':
+                        if active_alert is not None:
+                            active_alert = None
+                            modal_scroll = 0
+                            break
+                        return
+                    elif action == 'escape':
+                        # With mouse tracking, bare ESC is almost always a
+                        # split mouse sequence (release bytes arriving late).
+                        # Only honour ESC to dismiss when mouse is off.
+                        if not mouse and active_alert is not None:
+                            active_alert = None
+                            break
+                    elif action == 'open':
+                        if active_alert is not None and on_open:
+                            on_open(active_alert)
+                            break
+                    elif action == 'fwd':
+                        if auto_play:
+                            playing = False
+                            play_frame += 1
+                        else:
+                            offset += scroll_step
+                        if select.select([fd], [], [], 0)[0]:
+                            continue  # coalesce rapid scrolling
+                        break
+                    elif action == 'back':
+                        if auto_play:
+                            playing = False
+                            play_frame -= 1
+                        else:
+                            offset -= scroll_step
+                        if select.select([fd], [], [], 0)[0]:
+                            continue  # coalesce rapid scrolling
+                        break
+                    elif action == 'reset':
+                        if auto_play:
+                            playing = not playing  # space = play/pause
+                            if not playing:
+                                play_frame = 0  # pause returns to the home frame
+                        else:
+                            offset = 0
+                        break
+                    elif on_action is not None and isinstance(action, str) and action.startswith('key:'):
+                        if on_action(action[4:]):
+                            if select.select([fd], [], [], 0)[0]:
+                                continue  # coalesce held-down keys (zoom taps)
+                            break
+                    elif mouse and isinstance(action, tuple) and action[0] == 'mouse':
+                        _, cb, cx, cy, is_rel = action
+                        wheel_cb = _normalize_wheel_cb(cb)
+                        if wheel_cb in (64, 65):
+                            if on_wheel is not None:
+                                # Caller owns the wheel outright (zoom,
+                                # panel scroll, …) — no scrub fallback.
+                                if on_wheel(1 if wheel_cb == 64 else -1,
+                                            cx, cy):
+                                    if select.select([fd], [], [], 0)[0]:
+                                        continue  # coalesce rapid wheel
+                                    break
+                                continue
+                            if active_alert is not None:
+                                # Scroll the modal
+                                modal_scroll += 3 if wheel_cb == 65 else -3
+                                modal_scroll = max(0, modal_scroll)
+                            elif auto_play:
+                                playing = False
+                                play_frame += 1 if wheel_cb == 64 else -1
+                            else:
+                                offset += scroll_step if wheel_cb == 64 else -scroll_step
+                            if select.select([fd], [], [], 0)[0]:
+                                continue  # coalesce rapid scrolling
+                            break
+                        if is_rel:
+                            # Button release — completes a drag gesture if one
+                            # started; otherwise ignore.
+                            if drag_start is not None:
+                                dcol, drow = cx - drag_start[0], cy - drag_start[1]
+                                drag_start = None
+                                clicked = (dcol == 0 and drow == 0
+                                           and on_click is not None
+                                           and on_click(cx, cy))
+                                if on_drag(dcol, drow, True) or clicked:
+                                    break
+                            continue
+                        if (cb & 0b11) == 0 and not (cb & 0x20):
+                            # Left button press (not release, not motion)
+                            if on_drag is not None:
+                                drag_start = (cx, cy)
+                            row_idx = cy - 1  # 1-based → 0-based
+                            if active_alert is not None:
+                                # Click while modal open — dismiss
+                                active_alert = None
+                                modal_scroll = 0
+                                break
+                            elif row_idx in alert_row_map:
+                                active_alert = alert_row_map[row_idx]
+                                modal_scroll = 0
+                                break
+                        if cb & 32:
+                            if drag_start is not None:
+                                # mid-drag: live preview with cumulative delta
+                                dcol, drow = cx - drag_start[0], cy - drag_start[1]
+                                if on_drag(dcol, drow, False):
+                                    if select.select([fd], [], [], 0)[0]:
+                                        continue  # coalesce rapid drag motion
+                                    break
+                                continue
+                            # Hover-capable terminals.
+                            mouse_pos = (cx, cy)
+                            if select.select([fd], [], [], 0)[0]:
+                                continue  # coalesce rapid motion: render once at the final position
+                            break
+                        # Fallback for terminals without motion reporting:
+                        # update pointer on press so tooltip can still appear.
+                        if (cb & 0b11) in (0, 1, 2):
+                            mouse_pos = (cx, cy)
+                            break
+    except KeyboardInterrupt:
+        pass
+    # SystemExit is NOT swallowed: a sys.exit(1) from a render callback (or
+    # the signal handler above) must reach the shell as a nonzero status.
+    # The finally block still restores the terminal on its way out.
+    finally:
+        for _sig, _handler in prev_handlers.items():
+            try:
+                signal.signal(_sig, _handler)
+            except (ValueError, OSError):
+                pass
+        os.close(wake_r)
+        os.close(wake_w)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            cleanup = ""
+            if mouse:
+                cleanup += "\033[?1006l\033[?1003l\033[?1002l\033[?1000l"
+                if is_apple_terminal:
+                    cleanup += "\033[?1007l"
+            cleanup += "\033[?25h\033[?1049l"
+            sys.stdout.write(cleanup)
+            sys.stdout.flush()
+        except Exception:
+            pass  # tty may already be gone (SIGHUP); nothing left to restore
