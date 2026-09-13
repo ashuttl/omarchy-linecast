@@ -95,8 +95,12 @@ Panel {
   }
 
   function close() {
-    setCenterHoverRevealSuppressed(false)
+    // Hide first. Releasing the reveal flag talks to the host, and nothing
+    // the host does with that call should be able to leave the panel up:
+    // this panel owns the screen while it is open, so a close that does not
+    // land reads as a frozen desktop.
     root.controller.hide()
+    setCenterHoverRevealSuppressed(false)
   }
 
   function toggle() {
@@ -110,8 +114,15 @@ Panel {
     return false
   }
 
+  // Omarchy 4.0.3 hands an installed plugin a PluginBarApi facade in place of
+  // the Bar, and there centerHoverRevealSuppressed is read-only: writing it
+  // throws, which took the rest of close() with it. Bar and the facade both
+  // carry the setter as of 4.0.3; the direct write stays for older hosts.
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
+    if (!root.bar) return
+    if (typeof root.bar.setCenterHoverRevealSuppressed === "function")
+      root.bar.setCenterHoverRevealSuppressed(value)
+    else if ("centerHoverRevealSuppressed" in root.bar)
       root.bar.centerHoverRevealSuppressed = value
   }
 
