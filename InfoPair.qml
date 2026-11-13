@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // One label/value line of the stock two-column info grid (battery panel's
 // "Battery size   51Wh" rows): dim label left, value pushed right.
@@ -8,7 +9,7 @@ Row {
 
   property string label: ""
   property string value: ""
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
 
   width: parent ? parent.width : implicitWidth

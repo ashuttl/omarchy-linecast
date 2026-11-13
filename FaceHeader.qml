@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // The stock panel header, as the battery/power panel composes it: icon,
 // bold title over a small-caps status line, and a display-sized value on
@@ -13,7 +14,7 @@ Item {
   property string title: ""
   property string subtitle: ""
   property string bigValue: ""
-  property color foreground: Color.foreground
+  property color foreground: Commons.Color.foreground
   property string fontFamily: Style.font.family
 
   // When set, the title block is a control (the weather face's location
@@ -23,7 +24,7 @@ Item {
   signal clicked()
 
   readonly property color titleColor: interactive && headerMouse.containsMouse
-    ? Style.hoverStateColor(foreground, Color.accent)
+    ? Style.hoverStateColor(foreground, Commons.Color.accent)
     : foreground
 
   width: parent ? parent.width : implicitWidth

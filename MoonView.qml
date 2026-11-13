@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -18,7 +19,7 @@ Item {
 
   readonly property int panelWidth: Style.space(320)
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color muted: Qt.darker(foreground, 1.4)
 
@@ -196,7 +197,11 @@ Item {
 
         InfoPair {
           label: "Next full"
-          value: view.payload && view.payload.next_full ? Model.shortDate(view.payload.next_full) : ""
+          // linecast 2 names the full moon ("Beaver"); earlier ones don't.
+          value: view.payload && view.payload.next_full
+            ? Model.shortDate(view.payload.next_full)
+              + (view.payload.next_full_name ? " · " + view.payload.next_full_name : "")
+            : ""
           foreground: view.foreground
           fontFamily: view.fontFamily
         }
