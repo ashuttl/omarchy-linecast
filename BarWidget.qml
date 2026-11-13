@@ -21,8 +21,8 @@ import qs.Ui
 // here still points at this directory: they share the one copy of the
 // scripts, the panel, and the views, and only bring their own identity.
 //
-// Pills read the scripts/ helpers (Waybar-style JSON from linecast's
-// --oneline output). Left click on a pill opens its anchored panel;
+// Pills read scripts/linecast-pill.sh (Waybar-style JSON, built from
+// linecast's --json output). Left click on a pill opens its anchored panel;
 // right click floats the full linecast TUI.
 BarWidget {
   id: root
@@ -408,7 +408,7 @@ BarWidget {
 
     Process {
       id: pillProc
-      command: ["bash", "-lc", "PATH=" + root.pluginDir + "bin:$PATH PILL_CLOCK=" + root.setting("clock", "24h") + " LINECAST_TEMP='" + root.tempFlag + "' " + root.scriptsDir + "/linecast-" + pill.pillName + ".sh | head -c 65536"]
+      command: ["bash", "-lc", "PATH=" + root.pluginDir + "bin:$PATH PILL_CLOCK=" + root.setting("clock", "24h") + " LINECAST_TEMP='" + root.tempFlag + "' " + root.scriptsDir + "/linecast-pill.sh " + pill.pillName + " | head -c 65536"]
       stdout: StdioCollector {
         waitForEnd: true
         onStreamFinished: pill.update(text)

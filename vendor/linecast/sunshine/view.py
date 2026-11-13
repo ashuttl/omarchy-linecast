@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""Solar arc — terminal visualization of the sun's daily journey.
+
+Renders a multi-line graphical display inspired by the Apple Watch Solar
+face. Shows the sun's sinusoidal arc above and below the horizon with a
+warm glow centered on the sun's current position, seasonal scaling, and day
+length with daily delta.
+
+The arc itself is drawn in braille — it is the data. The sky glow renders
+in half-block characters with ANSI color at 2x vertical sub-pixel
+resolution (true color when available). Location is cached from IP
+geolocation (~1 network call per week).
+
+Usage: sunshine [--print] [--oneline] [--json] [--year] [--location PLACE]
+                [--icons SET] [--emoji] [--classic-colors]
+"""
+
+import math
+from datetime import datetime
+
+from linecast.terminal.braille import braille_rows_from_ys
+from linecast.terminal.color import fg, RESET, lerp, interp_stops
+from linecast.terminal.textwidth import visible_len
+from linecast.terminal.framebuffer import get_terminal_size, Framebuffer
+from linecast._timefmt import fmt_time
+from linecast.terminal import theme as _theme
+from linecast.terminal.theme import darken, lighten
+from linecast._i18n import fmt_duration_parts, lang_of
+from linecast._location import (
+    location_is_pinned, location_tzinfo,
+)
+from linecast._runtime import RuntimeConfig, current_runtime, install_banner, place_for, set_current
+from linecast._parsers import refuse_view_flag, sunshine_parser
+from linecast.terminal.glyphs import icon_set
+from linecast.sunshine.palette import (
+    CURVE_COLOR, HORIZON_COLOR, INFO_AMBER_RGB, INFO_DIM_RGB, INFO_PURPLE_RGB,
+    INFO_TEXT_RGB, SKY_FAR_HORIZON, SKY_NEAR_HORIZON, SKY_NIGHT, SKY_ZENITH,
+    SUN_DOT_RGB, SUN_GLOW_RGB, SUN_GLOW_TWILIGHT_RGB,
+)
+from linecast.sunshine.solar import (
+    day_length_change, day_offset, polar_state, solar_times, sun_elevation,
+)
+from linecast._log import exits_on_user_error
+
+_theme.track_imports(globals(), "linecast.terminal.color")
+_theme.track_imports(globals(), "linecast.sunshine.palette")
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def corner_label_ink(cell):
+    """A dim ink for the corner label over a sky cell, light or dark."""
+    luma = 0.30 * cell[0] + 0.59 * cell[1] + 0.11 * cell[2]
+    return lighten(cell, 0.45) if luma < 130 else darken(cell, 0.55)
+
+
+def _corner_limit(graph_w):
+    """How much of the top row the corner label may take: half the chart."""
+    return max(0, graph_w // 2)
+
+
+def corner_label(location_label, clock, graph_w):
+    """The top-right label: the place and the clock, joined by a middle
+    dot, when the corner has room for both; the clock alone when it does
+    not, since a truncated place name would cost the time (issue #66).
+    """
+    if not location_label:
+        return clock
+    joined = f"{location_label} · {clock}"
+    if visible_len(joined) <= _corner_limit(graph_w):
+        return joined
+    return clock
+
+
+def corner_label_cells(label, graph_w, left=False):
+    """(x, char) overlay cells for a label right-aligned in the top row,
+    or left-aligned with *left*, one cell in from the edge.
+
+    Laid out by cell width, so a double-width glyph takes two columns:
+    its own, and an empty one after it that the framebuffer skips.
+    Truncated to half the chart.
+    """
+    from linecast.terminal.textwidth import cells as text_cells
+    cells, used = text_cells(label, _corner_limit(graph_w))
+    x0 = 1 if left else graph_w - used - 1
+    return [(x0 + off, ch) for off, ch in cells if 0 <= x0 + off < graph_w]
+
+
+def _solstice_range(lat, lng, tz_offset_h):
+    """The Sun's height at noon on the summer solstice and at midnight
+    on the winter one: the June solstice in the north, December's in
+    the south."""
+    days = (172, 355)
+    return (max(sun_elevation(lat, lng, 12, d, tz_offset_h) for d in days),
+            min(sun_elevation(lat, lng, 0, d, tz_offset_h) for d in days))
+
+
+def render(lat, lng, doy, now_hour, fullscreen=False, offset_minutes=0, runtime=None,
+           tz_offset_h=None, location_label="", now=None, hours=None, show_text=True):
+    """Build the complete multi-line solar arc display.
+
+    `now` is the shown moment as a datetime, scrubbing included; when
+    given, the corner names its time beside the place, and its weekday
+    when that is not the user's own. `hours` is the day read in a
+    tradition's hours (an astro.hours.DayHours) for the top-left corner and
+    the marks line under the chart, which costs the chart a row.
+    With `show_text` off, only the location and clock remain.
+    """
+    if runtime is None:
+        runtime = current_runtime(RuntimeConfig)
+    icons = icon_set(runtime)
+    cols, rows = get_terminal_size()
+    if now is None or not show_text:
+        hours = None
+
+    # --- dimensions: fill the terminal ---
+    graph_w = max(1, cols)
+    reserve = ((2 if hours else 1) if fullscreen else 6) if show_text else (0 if fullscreen else 5)
+    graph_h = max(6, rows - reserve)
+    total_spy = graph_h * 2
+
+    # --- elevation curve for today ---
+    elevations = []
+    for x in range(graph_w):
+        h = (x + 0.5) / graph_w * 24
+        elevations.append(sun_elevation(lat, lng, h, doy, tz_offset_h))
+
+    # --- seasonal vertical scale ---
+    summer_peak, winter_trough = _solstice_range(lat, lng, tz_offset_h)
+    annual_max = max(summer_peak, max(elevations), 5)
+    annual_min = min(winter_trough, min(elevations), -5)
+
+    # Horizon placement — proportional to annual range
+    horizon_frac = annual_max / (annual_max - annual_min)
+    horizon_spy = int(total_spy * horizon_frac)
+    horizon_spy = max(2, min(total_spy - 2, horizon_spy))
+    # Even, so the horizon hairline's braille cell is entirely sky — its
+    # overlay background blends to pure sky and the edge stays crisp.
+    horizon_spy -= horizon_spy % 2
+
+    def elev_to_spy(elev):
+        """Elevation → sub-pixel row (float). 0=top, total_spy-1=bottom."""
+        if elev >= 0:
+            return horizon_spy * (1 - elev / annual_max)
+        else:
+            below = total_spy - horizon_spy
+            return horizon_spy + abs(elev) / abs(annual_min) * below
+
+    # Current sun position
+    now_x = max(0, min(graph_w - 1, int(now_hour / 24 * graph_w)))
+    now_elev = sun_elevation(lat, lng, now_hour, doy, tz_offset_h)
+    now_spy = max(0.0, min(total_spy - 1.0, elev_to_spy(now_elev)))
+
+    sunrise, sunset = solar_times(lat, lng, doy, tz_offset_h)
+
+    # --- build framebuffer ---
+    fb = Framebuffer(graph_w, graph_h, bg_color=SKY_NIGHT)
+
+    # 1. Sky glow — above horizon, centered on sun, irrespective of arc
+    if now_elev > -18:
+        sky_near_h = interp_stops(SKY_NEAR_HORIZON, now_elev)
+        sky_far_h  = interp_stops(SKY_FAR_HORIZON, now_elev)
+        sky_z      = interp_stops(SKY_ZENITH, now_elev)
+
+        # Overall brightness: ramps from 0 at -18° to 1 around +2°
+        brightness = max(0, min(1, (now_elev + 18) / 20))
+
+        # Horizontal Gaussian spread: narrow twilight glow → wide daylight fill
+        t_sigma = max(0, min(1, (now_elev + 6) / 30))
+        glow_sigma = graph_w * (0.12 + 0.30 * t_sigma)
+
+        # Ambient sky floor: even far from sun, some blue during day
+        ambient = 0.15 * max(0, min(1, now_elev / 25))
+
+        # Vertical focus: once the sun is up, the glow centers on its plotted
+        # height; below the horizon it stays at the horizon, where the light
+        # is. Continuous through sunrise since now_spy == horizon_spy there.
+        focal_spy = min(now_spy, float(horizon_spy))
+
+        # Vertical spread: concentrated in twilight, fills the sky midday
+        t_height = max(0, min(1, (now_elev + 6) / 36))
+        v_sigma = max(1.0, horizon_spy * (0.25 + 0.95 * t_height))
+
+        for x in range(graph_w):
+            dx = x - now_x
+            h_gauss = math.exp(-0.5 * (dx / max(glow_sigma, 1)) ** 2)
+            h_intensity = max(ambient, h_gauss)
+
+            # Horizon color blends near↔far based on proximity to sun
+            horizon_color = lerp(sky_far_h, sky_near_h, h_gauss)
+
+            for spy in range(0, horizon_spy):
+                vert_frac = (horizon_spy - spy) / max(1, horizon_spy)
+
+                # Vertical blend: horizon → zenith color
+                sky_color = lerp(horizon_color, sky_z, vert_frac ** 0.65)
+
+                # Vertical intensity falloff around the focal point
+                v_factor = math.exp(-0.5 * ((spy - focal_spy) / v_sigma) ** 2)
+
+                intensity = brightness * h_intensity * v_factor
+                if intensity > 0.01:
+                    fb.set_pixel(x, spy, sky_color, intensity)
+
+    # 2. Curve line — braille, at 2x horizontal / 4x vertical dot resolution.
+    # The arc is the data here; it gets the fine-grained rendering, while the
+    # glow stays in half-block sub-pixels (like terrain shading on maps).
+    total_dots = graph_h * 4
+    dot_ys = []
+    for i in range(graph_w * 2):
+        h = (i + 0.5) / (graph_w * 2) * 24
+        e = sun_elevation(lat, lng, h, doy, tz_offset_h)
+        dot_ys.append(max(0, min(total_dots - 1, int(round(elev_to_spy(e) * 2)))))
+    curve_bits = braille_rows_from_ys(dot_ys, graph_w, graph_h)
+
+    # 3. Sun — radial glow
+    sun_spy_i = int(round(now_spy))
+    sun_spy_i = max(0, min(total_spy - 1, sun_spy_i))
+    sun_r = max(5, int(min(graph_w, total_spy) * 0.04))
+    sun_warm = SUN_GLOW_RGB if now_elev > -2 else SUN_GLOW_TWILIGHT_RGB
+
+    fb.draw_radial(now_x, now_spy, sun_warm, sun_r)
+
+    # Sun core — bright center
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            sx, sy = now_x + dx, sun_spy_i + dy
+            if 0 <= sx < graph_w and 0 <= sy < total_spy:
+                d = math.sqrt(dx * dx + (dy * 1.5) ** 2)
+                fb.set_pixel(sx, sy, SUN_DOT_RGB, max(0, 1 - d * 0.5))
+
+    # --- render framebuffer with braille horizon, curve, and sun overlays ---
+    overlays = {}
+    # Horizon — a dotted hairline (every third braille dot) on the sky side
+    # of the boundary. Each dot fades toward the lit sky behind it, so the
+    # line dissolves into daylight and only reads where the sky is dark.
+    # Yields where the arc passes.
+    hz_row = horizon_spy // 2 - 1
+    for dot_x in range(0, graph_w * 2, 3):
+        ci = dot_x // 2
+        if curve_bits[hz_row][ci]:
+            continue
+        cell = fb.cell_bg(ci, hz_row)
+        lit = min(1.0, max(abs(a - b) for a, b in zip(cell, fb.bg)) / 40)
+        if lit >= 1.0:
+            continue
+        dot = 0x40 if dot_x % 2 == 0 else 0x80
+        overlays[(ci, hz_row)] = (chr(0x2800 + dot), lerp(HORIZON_COLOR, cell, lit))
+    for row in range(graph_h):
+        for ci in range(graph_w):
+            if curve_bits[row][ci]:
+                overlays[(ci, row)] = (chr(0x2800 + curve_bits[row][ci]), CURVE_COLOR)
+    # Location and clock, dim, in the top-right corner. The sky there can
+    # be anything from night to full daylight, so the hint darkens against
+    # a lit cell rather than disappearing into it.
+    from linecast.sunshine.i18n import clock_label
+    label = location_label
+    if now is not None:
+        label = corner_label(location_label, clock_label(now, runtime), graph_w)
+    # The tradition's reading of the moment in the other corner, the
+    # same dim ink: the halachic hour, the Roman hora, the Edo koku.
+    # Where the two would meet, or the reading would run past its half
+    # of the row, the place yields first, as it does to a long name,
+    # then the reading's second part, then the reading.
+    left = ""
+    if hours is not None:
+        from linecast.sunshine.hours import corner_reading
+        left = corner_reading(hours, now, runtime)
+        while left and (visible_len(left) > _corner_limit(graph_w)
+                        or visible_len(left) + visible_len(label) + 3 > graph_w):
+            if label != clock_label(now, runtime):
+                label = clock_label(now, runtime)
+            elif " · " in left:
+                left = left.split(" · ")[0]
+            else:
+                left = ""
+    if label:
+        for x, ch in corner_label_cells(label, graph_w):
+            cell = fb.cell_bg(x, 0)
+            overlays[(x, 0)] = (ch, corner_label_ink(cell), False)
+    if left:
+        for x, ch in corner_label_cells(left, graph_w, left=True):
+            cell = fb.cell_bg(x, 0)
+            overlays[(x, 0)] = (ch, corner_label_ink(cell), False)
+    sun_cell_row = sun_spy_i // 2
+    overlays[(now_x, sun_cell_row)] = (icons["sun_char"], SUN_DOT_RGB)
+    # The help hint takes the top-left corner, as in the year view, so
+    # the info line stays balanced: sunrise at one end, sunset at the
+    # other. With a tradition's reading in that corner, or the sun
+    # itself, it falls back to the last line instead.
+    from linecast.terminal import help as _help
+    from linecast._i18n import lang_of
+    lang = lang_of(runtime)
+    painted = fullscreen and show_text and _help.paint_hint(fb, overlays, lang, rows=(0,))
+    lines = fb.render(overlays)
+
+    if show_text:
+        # --- info line ---
+        # With a marks line under the info line, the last line is the marks
+        # line.
+        hint_w = visible_len(_help.hint(lang, cols)) + 2 if fullscreen and not painted else 0
+        info_width = cols if hours else cols - hint_w
+        lines.append(
+            _info_line(
+                lat,
+                lng,
+                doy,
+                sunrise,
+                sunset,
+                info_width,
+                runtime,
+                now_hour,
+                offset_minutes,
+                tz_offset_h,
+                day=now.date() if now is not None else None,
+            )
+        )
+        if hours is not None:
+            from linecast.sunshine.hours import hours_line
+            lines.append(hours_line(hours, now, cols - hint_w, runtime))
+        if fullscreen and not painted:
+            lines[-1] = _help.footer(lines[-1], cols, lang)
+
+    hint = install_banner()
+    if hint:
+        lines.append(hint)
+
+    return "\n".join(lines)
+
+def _info_line(lat, lng, doy, sunrise, sunset, width, runtime, now_hour=None, offset_minutes=0,
+               tz_offset_h=None, day=None):
+    """Sunrise — day length (delta) — sunset.
+
+    *day*, the shown date, lets a day with a name say it: Yalda, the
+    longest night, where the dates are Solar Hijri."""
+    from linecast.sunshine.i18n import polar_name
+
+    icons = icon_set(runtime)
+    # Truncated, both: the length to the minute, the change to the second.
+    day_len, delta_sec = day_length_change(lat, lng, doy, tz_offset_h)
+    dl_h = int(day_len)
+    dl_m = int((day_len - dl_h) * 60)
+    d_sign = "+" if delta_sec >= 0 else "−"
+    d_abs = abs(delta_sec)
+    d_m = int(d_abs) // 60
+    d_s = int(d_abs) % 60
+
+    amber = fg(*INFO_AMBER_RGB)
+    purple = fg(*INFO_PURPLE_RGB)
+    dim = fg(*INFO_DIM_RGB)
+    text = fg(*INFO_TEXT_RGB)
+
+    lang = lang_of(runtime)
+    # Under a minute, the seconds alone: "−15s", not "−0m 15s"; under a
+    # second, "+0m", never "−0m".
+    parts = [("m", d_m), ("s", d_s)] if d_m and d_s else [("s", d_s)] if d_s else [("m", d_m)]
+    if not (d_m or d_s):
+        d_sign = "+"
+    delta_str = fmt_duration_parts(lang, *parts, sign=d_sign)
+    day_len_str = fmt_duration_parts(lang, ("h", dl_h), ("m", dl_m))
+
+    # Through a polar season there is no sunrise or sunset to print: the
+    # dashes stand where the times would, and the phrase takes the place
+    # of a day-length delta that is zero every day of it.
+    polar = polar_state(day_len)
+    rise_txt = "—" if polar else fmt_time(sunrise, runtime.use_24h)
+    set_txt = "—" if polar else fmt_time(sunset, runtime.use_24h)
+
+    left = f"{amber}{icons['sun_icon']} {text}{rise_txt}"
+    if offset_minutes:
+        centers = [f"{text}{fmt_time(now_hour, runtime.use_24h)}"]
+    elif polar:
+        centers = [f"{text}{day_len_str} {dim}· {polar_name(polar, runtime)}"]
+    else:
+        centers = [f"{text}{day_len_str} {dim}({delta_str})"]
+    right = f"{text}{set_txt} {purple}{icons['sunset_icon']}"
+
+    lw = visible_len(left)
+    rw = visible_len(right)
+    # In a narrow window the center gives way, the change first and
+    # then the length, so the times at either end are never cut off.
+    if not offset_minutes:
+        centers += [f"{text}{day_len_str}", ""]
+    center = next((c for c in centers if lw + visible_len(c) + rw + 2 <= width), "")
+    cw = visible_len(center)
+
+    # Yalda, the night of 30 Azar that closes the year's shortest day,
+    # is named after the day length: it is the day this line is about.
+    night_name = _named_night(day, runtime)
+    if night_name and lw + cw + visible_len(night_name) + 3 + rw + 2 <= width:
+        center += f" {dim}· {text}{night_name}"
+        cw = visible_len(center)
+
+    # The sky at the shown moment, dim, after the center — when it fits.
+    # A polar center already names the sky for the whole day.
+    if now_hour is not None and not polar:
+        sky = _sky_name(lat, lng, doy, now_hour, sunrise, sunset,
+                        tz_offset_h, runtime)
+        if lw + cw + visible_len(sky) + 3 + rw + 2 <= width:
+            center += f" {dim}· {sky}"
+            cw = visible_len(center)
+
+    if lw + cw + rw + 2 > width:
+        # narrower than the two times: the sunrise alone, then nothing
+        return f"{RESET}{left if lw <= width else ''}{RESET}"
+    total_gap = max(0, width - lw - cw - rw)
+    left_gap = max(1, total_gap // 2)
+    right_gap = max(1, total_gap - left_gap)
+    line = f"{left}{' ' * left_gap}{center}{' ' * right_gap}{right}"
+
+    return f"{RESET}{line}{RESET}"
+
+def _named_night(day, runtime):
+    """شب یلدا on 30 Azar where the dates are Solar Hijri, else None."""
+    if day is None:
+        return None
+    from linecast.astro.calendars.civil import SOLAR_HIJRI, civil_calendar
+    lang = lang_of(runtime)
+    if civil_calendar(lang) != SOLAR_HIJRI:
+        return None
+    from linecast.astro.calendars.solar_hijri import observance_key
+    if observance_key(day) != "yalda":
+        return None
+    from linecast.moon.i18n import solar_hijri_observance_name
+    return solar_hijri_observance_name("yalda", lang)
+
+
+def _sky_name(lat, lng, doy, hour, sunrise, sunset, tz_offset_h, runtime):
+    """Name the sky at a moment: an event within five minutes, else the phase."""
+    from linecast.sunshine.i18n import sky_event, sky_phase
+    events = [("solar_noon", (sunrise + sunset) / 2)]
+    if 0.05 < sunset - sunrise < 23.95:
+        events += [("sunrise", sunrise), ("sunset", sunset)]
+    for key, at in events:
+        if abs(hour - at) <= 5 / 60:
+            return sky_event(key, runtime)
+    return sky_phase(sun_elevation(lat, lng, hour, doy, tz_offset_h), runtime,
+                     morning=hour < (sunrise + sunset) / 2)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+@exits_on_user_error
+def main():
+    parser = sunshine_parser()
+    args = parser.parse_args()
+    runtime = RuntimeConfig.from_sources(args)
+    set_current(runtime)
+
+    if args.year:
+        refuse_view_flag(parser, "--year", runtime)
+    lat, lng, country, label, runtime = place_for(
+        args, runtime, zone=True, name=not (runtime.json_mode or runtime.oneline))
+
+    # A pinned location may sit in another time zone; resolve it so times
+    # match the location. None (IP-derived location) means machine-local
+    # time already is the location's local time.
+    tz = location_tzinfo(lat, lng) if location_is_pinned(args.location) else None
+
+    def _now():
+        # datetime.now(None) is naive machine-local, matching old behavior.
+        return datetime.now(tz)
+
+    # The day read in a tradition's hours, from the flag, the saved
+    # setting, or the language; None keeps the civil clock alone. The
+    # table is built for the shown moment's date, cached by date, so
+    # scrubbing pays for it once a day.
+    from linecast.astro.hours import hours_now, resolve_hours, system_of
+    hours_name, _source = resolve_hours(args.hours, runtime.lang)
+    hours_system, hours_variant = system_of(hours_name)
+    # The prayer-time method follows the country of the place shown.
+    # resolve_location leaves the country blank for an override, so
+    # it is reverse geocoded then (cached), as the moon does for the
+    # Hebrew holidays; still blank, the Muslim World League's angles.
+    hours_country = country
+    if hours_system == "islamic" and not hours_country:
+        try:
+            from linecast._geocode import reverse_geocode
+            hours_country = reverse_geocode(lat, lng)[1]
+        except Exception:
+            hours_country = None
+
+    def _hours(now):
+        if hours_system is None:
+            return None
+        return hours_now(hours_system, now, lat, lng, tz, hours_variant,
+                         country=hours_country)[0]
+
+    if runtime.json_mode:
+        import json
+        from linecast.sunshine.json import build_payload
+        now = _now()
+        print(json.dumps(build_payload(lat, lng, now=now, hours=_hours(now)),
+                         ensure_ascii=False))
+        return
+
+    if runtime.oneline:
+        from linecast.terminal.oneline import emit
+        from linecast.sunshine.oneline import sunshine_oneline
+        now = _now()
+        doy = now.timetuple().tm_yday
+        emit(sunshine_oneline(lat, lng, doy, runtime,
+                              tz_offset_h=day_offset(now.date(), now.tzinfo),
+                              hours=_hours(now), now=now))
+        return
+
+    # Both views read from the right in a right-to-left language: the
+    # day's arc is plotted by the hour, midnight to midnight, and the
+    # year by the date, so both are time running leftward.
+    from linecast.terminal import bidi as _bidi
+    _bidi.set_mirror(True)
+
+    # Both views name the place in a corner. The forward geocoder already
+    # labeled a place-name override; otherwise the (cached) reverse
+    # geocoder names the coordinates, as radar does.
+    from linecast._geocode import place_label
+    location_label = (place_label(lat, lng, label, runtime.lang).split(",")[0].strip()
+                      or f"{lat:.2f},{lng:.2f}")
+
+    from linecast.sunshine.live import SunshineApp
+    app = SunshineApp(_now, lat, lng, runtime, tz=tz, hours_at=_hours,
+                      year=getattr(args, "year", False), dst=getattr(args, "dst", False),
+                      location_label=location_label, show_text=not args.no_text)
+    if not runtime.live:
+        from linecast.terminal.live import print_view
+        print_view(app.render)
+        return
+    app.run()

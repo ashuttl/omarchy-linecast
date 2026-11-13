@@ -1,47 +1,144 @@
 """python -m linecast / linecast CLI entry point."""
 
+import errno
+import os
 import sys
-from linecast import __version__
-from linecast._completion import completion_help, render_completion
+from linecast._commands import SETTINGS, VIEW_NAMES, help_text
+from linecast._completion import available_shells, completion_help, render_completion
 
-HELP = f"""\
-linecast {__version__} — weather, sunlight, tides, radar, the Moon, and maps for the terminal
 
-Commands:
-  linecast weather     Weather dashboard with braille temperature curve and alerts
-  linecast sunshine    Solar arc inspired by the Apple Watch Solar face
-  linecast moon        Moon phase, illumination, and rise/set times
-  linecast tides       Tide chart with braille rendering (NOAA, CHS, QLD + global model)
-  linecast radar       Weather radar over a braille basemap (US + global)
-  linecast maps        Street and terrain maps: vector streets or hillshaded relief
-  linecast location    Show or set a fixed location (overrides IP geolocation)
-  linecast units       Show or set preferred units (metric or imperial)
-  linecast completion  Print shell completion script (bash, zsh, fish, nushell)
+def sky_now():
+    """The Moon tonight, in one line, for the foot of the help page.
 
-Each command is also installed as a standalone binary (weather, sunshine,
-moon, tides, radar, maps). Run any command with --help for options.
-"""
+    The help page is where linecast introduces itself, and this is the
+    one thing it can say about the sky without a place or a network:
+    the phase is arithmetic on the clock. Nothing here is worth failing
+    the help page over, so any trouble returns an empty string.
+    """
+    try:
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        from linecast._runtime import resolve_icons
+        from linecast.astro.ephemeris import moon_illuminated_fraction
+        from linecast.moon.phase import moon_phase
+        from linecast.terminal import theme
+        now = datetime.now(timezone.utc)
+        icons, _source = resolve_icons()
+        _idx, name, icon = moon_phase(now, SimpleNamespace(icons=icons), bg_color=theme.theme_bg)
+        return f"{icon} {name}, {moon_illuminated_fraction(now) * 100:.0f}% lit"
+    except Exception:
+        return ""
+
 
 COMMANDS = {
-    "weather": "linecast.weather",
-    "sunshine": "linecast.sunshine",
-    "moon": "linecast.moon",
-    "tides": "linecast.tides",
-    "radar": "linecast.radar",
-    "maps": "linecast.maps",
-    "location": "linecast.location",
-    "units": "linecast.units",
+    "weather": "linecast.weather.view",
+    "sunshine": "linecast.sunshine.view",
+    "moon": "linecast.moon.view",
+    "sky": "linecast.sky.view",
+    "tides": "linecast.tides.view",
+    "radar": "linecast.radar.view",
+    "maps": "linecast.maps.view",
+    # each setting's command is its module in settings/
+    **{name: f"linecast.settings.{name}" for name, _blurb in SETTINGS},
+    "link": "linecast.link",
+    "doctor": "linecast.doctor",
 }
+
+# Commands for working on linecast itself: they dispatch, but the help
+# page and the completions do not mention them.
+HIDDEN = {
+    "prose": "linecast.prose",
+}
+
+# The commands that answer to their own name as argv[0], for users and
+# distro packages that link or copy the binary under a short name. Only
+# these dispatch: the utility commands (location, units, doctor) have no
+# standalone spelling to honour.
+STANDALONE = VIEW_NAMES
+
+
+def _run(cmd, args):
+    # Shift argv so the subcommand sees itself as argv[0], keeping the
+    # original where `linecast link` can find the binary.
+    from linecast import _runtime
+    _runtime.INVOKED_AS = sys.argv[0]
+    sys.argv = [f"linecast {cmd}"] + list(args)
+    if cmd in VIEW_NAMES:
+        # once a day, the cached files no view will read again
+        from linecast._cache import sweep
+        sweep()
+    import importlib
+    mod = importlib.import_module(COMMANDS.get(cmd) or HIDDEN[cmd])
+    mod.main()
 
 
 def main():
+    # A reader that closes early -- `linecast weather --print | head` --
+    # ends a run with EPIPE on stdout.  That is the reader's choice, not
+    # a failure: swallow it, and give the interpreter something other
+    # than the broken pipe to flush at exit, or it reports the same
+    # error once more on the way out.  Output shorter than the buffer
+    # reaches the pipe only at that flush, so flush here, where the
+    # error can still be caught.
+    try:
+        try:
+            _main()
+        finally:
+            sys.stdout.flush()
+    except KeyboardInterrupt:
+        # Ctrl-C while a view is still fetching, or in --print: the
+        # reader's choice again, not a traceback's
+        sys.exit(130)
+    except OSError as exc:
+        if not _reader_gone(exc):
+            raise
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(0)
+
+
+def _reader_gone(exc):
+    """Whether an error writing stdout says the reader has closed it.
+
+    POSIX reports it as EPIPE.  Windows has no reader to signal: its C
+    runtime turns the pipe's ERROR_NO_DATA into EINVAL, so on Windows
+    an EINVAL from stdout is taken the same way.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return sys.platform == "win32" and exc.errno == errno.EINVAL
+
+
+def _main():
+    # A binary named for a command is that command: a symlink or copy
+    # of the linecast binary called `weather` runs the weather command,
+    # arguments untouched.  Distro packages ship the short commands as
+    # symlinks to this binary, so a name some other package owns can be
+    # left out without losing the command.  lower() and splitext cover
+    # Windows, where the copy is weather.exe.
+    prog = os.path.splitext(os.path.basename(sys.argv[0] or ""))[0].lower()
+    if prog in STANDALONE:
+        _run(prog, sys.argv[1:])
+        return
+
     args = sys.argv[1:]
 
+    # The version comes from importlib.metadata, which costs more than
+    # the rest of this dispatch put together, so only the branches that
+    # print it look it up.
     if not args or args[0] in ("-h", "--help"):
-        print(HELP.rstrip())
+        from linecast import __version__
+        print(help_text(__version__))
+        sky = sky_now()
+        if sky:
+            print()
+            print(sky)
         sys.exit(0)
 
     if args[0] in ("-v", "--version"):
+        from linecast import __version__
         print(f"linecast {__version__}")
         sys.exit(0)
 
@@ -54,22 +151,21 @@ def main():
             print(render_completion(completion_args[0]), end="")
         except ValueError:
             print(f"linecast completion: unknown shell '{completion_args[0]}'", file=sys.stderr)
-            print("Expected one of: bash, zsh, fish", file=sys.stderr)
+            print(f"Expected one of: {', '.join(available_shells())}", file=sys.stderr)
             sys.exit(2)
         sys.exit(0)
 
     cmd = args[0]
-    if cmd not in COMMANDS:
+    if cmd not in COMMANDS and cmd not in HIDDEN:
+        import difflib
         print(f"linecast: unknown command '{cmd}'", file=sys.stderr)
-        print(f"Run 'linecast --help' for usage.", file=sys.stderr)
+        near = difflib.get_close_matches(cmd, list(COMMANDS), n=1)
+        if near:
+            print(f"Did you mean 'linecast {near[0]}'?", file=sys.stderr)
+        print("Run 'linecast --help' for usage.", file=sys.stderr)
         sys.exit(1)
 
-    # Shift argv so the subcommand sees itself as argv[0]
-    sys.argv = [f"linecast {cmd}"] + args[1:]
-
-    import importlib
-    mod = importlib.import_module(COMMANDS[cmd])
-    mod.main()
+    _run(cmd, args[1:])
 
 
 if __name__ == "__main__":

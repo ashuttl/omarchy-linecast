@@ -1096,7 +1096,7 @@ Item {
           tooltipText: modelData.tip
           fontSize: Style.font.bodySmall
           bordered: true
-          selected: (view.windUnit === "km/h") === (modelData.key === "metric")
+          selected: (view.windUnit !== "mph") === (modelData.key === "metric")
           foreground: view.foreground
           fontFamily: view.fontFamily
           onClicked: view.setUnits(modelData.key)

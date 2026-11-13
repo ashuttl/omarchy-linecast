@@ -43,7 +43,7 @@ change together when you switch themes.
 ## Requirements
 
 Nothing beyond a stock Omarchy. The plugin carries its own copy of
-linecast (`vendor/linecast`, v1.15.1, MIT, same author) and runs it with
+linecast (`vendor/linecast`, v2.12.0, MIT, same author) and runs it with
 the system Python — linecast has no dependencies outside the standard
 library. If you have linecast installed already, from the AUR
 (`yay -S linecast`) or with `uv tool install linecast`, the plugin uses
@@ -70,7 +70,7 @@ omarchy plugin remove ashuttl.linecast
 
 That takes the widget off the bar and deletes the plugin, bundled
 linecast included. A few small files are left for you to delete by hand
-if you like: the pill caches at `~/.cache/omarchy-bar-*-oneline`, the
+if you like: the pill caches at `~/.cache/omarchy-bar-*.json`, the
 plugin's compiled Python at `~/.cache/omarchy-linecast/`, the location
 recents at `~/.local/state/omarchy/linecast-recent-locations.json`, and
 linecast's own settings and caches at `~/.config/linecast/` and
@@ -93,7 +93,8 @@ on save:
 
 - `alwaysShow` (default `false`) — keep every pill out instead of sliding
   the extras in on hover.
-- `clock` (default `24h`) — `24h` or `12h` times in the pills and panels.
+- `clock` (default `24h`) — `24h` or `12h` times in the pills and panels,
+  whichever clock linecast itself is set to.
 - `temperature` (default: follow linecast) — `fahrenheit` or `celsius`,
   independent of linecast's metric/imperial setting, so °C with mph is a
   choice. Wind, rain, and tide-height units come from `linecast units
@@ -116,12 +117,13 @@ omarchy-shell shell toggle ashuttl.linecast        # last-used face
 Everything runs through `bin/linecast`, a small wrapper that picks an
 installed linecast when one is on `PATH` and the bundled tree otherwise
 (`bin/linecast --source` tells you which). The pills shell out to
-`scripts/linecast-*.sh`, which cache linecast's `--oneline` output under
-`~/.cache/`; each panel runs its `linecast <command> --json` on first open
-and refetches when stale. Nothing here talks to the network directly —
+`scripts/linecast-pill.sh`, which caches `linecast <command> --json` under
+`~/.cache/` and works the countdowns out from it; each panel runs the same
+command on first open and refetches when stale. Any linecast from 1.9 on
+will do. Nothing here talks to the network directly —
 linecast does, to Open-Meteo, NOAA, and the other sources it documents.
 
-`scripts/vendor.sh v1.15.1` refreshes the bundled copy from a linecast
+`scripts/vendor.sh v2.12.0` refreshes the bundled copy from a linecast
 tag.
 
 ## License

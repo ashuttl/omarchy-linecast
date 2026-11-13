@@ -1,0 +1,323 @@
+"""The baked sky: stars, their names, the constellations, the Milky Way.
+
+Everything here is read from src/linecast/data, written by
+scripts/build_sky_catalogue.py, and loaded once per process on first
+use. The moon view takes its star field from `star_positions`; the sky
+view takes all of it, plus the faint HYG supplement in `deep`.
+
+The stars are the Yale Bright Star Catalogue to magnitude 6.5, brightest
+first, so a prefix of the list is the sky to some limiting magnitude.
+Positions are J2000 in the file, here, and in everything built from
+them — the constellation figures, the Milky Way raster, the Messier
+objects beside them — and are precessed to the equinox of date at render
+time, since the Sun, the Moon and the planets they are drawn among are
+computed there (`astro.ephemeris.precession_at`, `sky.scene.Scene.catalogue`).
+"""
+
+import gzip
+import json
+import math
+import struct
+from linecast._paths import data_path
+from linecast._log import log_failure
+from linecast._i18n import base_language, setting
+
+_DATA = data_path()
+
+_stars = None       # [(ra_rad, dec_rad, vmag, b_v)] brightest first
+_vectors = None     # [(x, y, z)] unit vectors, equatorial frame, parallel
+_names = None       # {index: (proper name or "", designation or "")}
+_translated = None  # {index: {lang: name}} where a language names a star its own way
+_by_lang = {}       # star_names(lang), built once per language
+_constellations = None
+_milky_way = None
+_cultures = None    # {stellarium id: raw record}
+_culture_cache = {}  # short name -> prepared record
+
+
+def stars():
+    """[(ra_rad, dec_rad, vmag, b_v)] brightest first."""
+    global _stars
+    if _stars is None:
+        try:
+            data = (_DATA / "stars.bin").read_bytes()
+            _stars = [(math.radians(ra / 100.0), math.radians(dec / 100.0),
+                       mag / 10.0, bv / 50.0)
+                      for ra, dec, mag, bv in struct.iter_unpack("<Hhbb", data)]
+        except Exception as exc:
+            log_failure("stars", "star catalogue load", exc, fallback="no stars")
+            _stars = []
+    return _stars
+
+
+def star_positions():
+    """[(ra_rad, dec_rad)] brightest first — the moon view's star field."""
+    return [(ra, dec) for ra, dec, _mag, _bv in stars()]
+
+
+def star_vectors():
+    """Unit vectors in the equatorial frame, one per star: x toward the
+    vernal equinox, z toward the north celestial pole."""
+    global _vectors
+    if _vectors is None:
+        _vectors = [equatorial_vector(ra, dec) for ra, dec, _m, _b in stars()]
+    return _vectors
+
+
+def equatorial_vector(ra, dec):
+    """The unit vector of right ascension *ra* and declination *dec*, radians."""
+    c = math.cos(dec)
+    return (c * math.cos(ra), c * math.sin(ra), math.sin(dec))
+
+
+def _load_sky():
+    global _names, _translated, _constellations
+    if _names is not None:
+        return
+    try:
+        sky = json.loads(gzip.decompress((_DATA / "sky.json.gz").read_bytes()))
+        _names = {}
+        _translated = {}
+        for i, proper, desig, *rest in sky["names"]:
+            _names[i] = (proper, desig)
+            if rest:
+                _translated[i] = rest[0]
+        _constellations = []
+        for c in sky["constellations"]:
+            ra, dec = c["at"]
+            _constellations.append({
+                "id": c["id"], "name": c["name"], "gen": c["gen"],
+                "names": c["names"],
+                "at": equatorial_vector(math.radians(ra / 100.0),
+                                        math.radians(dec / 100.0)),
+                "lines": [[equatorial_vector(math.radians(ra / 100.0),
+                                             math.radians(dec / 100.0))
+                           for ra, dec in line] for line in c["lines"]],
+            })
+    except Exception as exc:
+        log_failure("sky", "sky catalogue load", exc,
+                    fallback="no names or constellations")
+        _names, _translated, _constellations = {}, {}, []
+
+
+def star_names(lang=None):
+    """{index: (proper name or "", designation or "")}, indexed as `stars`:
+    the IAU's names, or with *lang* the names that language prints where
+    it has its own (Syriusz, シリウス, ดาวเหนือ) and the IAU's elsewhere."""
+    _load_sky()
+    if lang is None or lang == "en":
+        return _names
+    if lang not in _by_lang:
+        base = base_language(lang)
+        _by_lang[lang] = {i: (_translated.get(i, {}).get(lang)
+                              or _translated.get(i, {}).get(base) or proper, desig)
+                          for i, (proper, desig) in _names.items()}
+    return _by_lang[lang]
+
+
+def constellations():
+    """One record per constellation: id, Latin name and genitive, names
+    in other languages where they differ, the label position `at` and the
+    figure `lines`, both as equatorial unit vectors."""
+    _load_sky()
+    return _constellations
+
+
+def record_name(record, lang):
+    """A constellation's or an asterism's name in *lang*, or its own: the
+    Latin for a constellation, the English for an asterism."""
+    names = record["names"]
+    return names.get(lang) or names.get(base_language(lang)) or record["name"]
+
+
+MILKY_WAY_W, MILKY_WAY_H = 1080, 540
+
+
+def milky_way():
+    """The Milky Way's brightness, 0–255, as a 1080×540 raster in
+    celestial coordinates: right ascension 0h at the centre, increasing
+    to the left as the sky is seen from inside, declination +90° at the
+    top. Empty bytes if the raster is missing."""
+    global _milky_way
+    if _milky_way is None:
+        try:
+            _milky_way = gzip.decompress((_DATA / "milkyway.bin.gz").read_bytes())
+            if len(_milky_way) != MILKY_WAY_W * MILKY_WAY_H:
+                raise ValueError(f"raster is {len(_milky_way)} bytes")
+        except Exception as exc:
+            log_failure("sky", "Milky Way load", exc, fallback="no Milky Way")
+            _milky_way = b""
+    return _milky_way
+
+
+# ---------------------------------------------------------------------------
+# Sky cultures
+# ---------------------------------------------------------------------------
+# The short names the flag and the setting take, and Stellarium's
+# directory names behind them (see scripts/build_sky_catalogue.py).
+CULTURES = {
+    "anutan": "anutan", "belarusian": "belarusian", "blackfoot": "blackfoot",
+    "boorong": "boorong", "bugis": "bugis", "chinese": "chinese",
+    "chinese-modern": "chinese_contemporary", "hawaiian": "hawaiian_starlines",
+    "indian": "indian", "japanese": "japanese_moon_stations", "mandar": "mandar",
+    "maori": "maori", "mongolian": "mongolian", "norse": "norse",
+    "romanian": "romanian", "ruelle": "ruelle", "sami": "sami",
+    "siberian": "siberian", "tongan": "tongan", "tukano": "tukano",
+    "snt": "western_SnT", "rey": "western_rey",
+}
+
+
+def resolve_culture(flag, lang):
+    """The sky culture to draw, and where it came from.
+
+    Returns (name, source): the culture, or None for the IAU sky;
+    source is "flag", "config", or "auto".  Precedence: the --culture
+    flag > the `linecast culture` setting > the culture native to the
+    UI language > none. 'none' anywhere in that chain stops it.
+    """
+    from linecast._config import saved
+    choice, source = flag, "flag"
+    if not choice:
+        choice, source = saved("culture"), "config"
+    if not choice:
+        # The culture a language brings with it, as the moon's calendars do.
+        choice, source = setting(lang, "sky_culture"), "auto"
+    return (None if choice in (None, "none", "iau") else choice), source
+
+
+def _load_cultures():
+    global _cultures
+    if _cultures is None:
+        try:
+            raw = json.loads(gzip.decompress((_DATA / "cultures.json.gz").read_bytes()))
+            _cultures = {c["id"]: c for c in raw}
+        except Exception as exc:
+            log_failure("sky", "sky cultures load", exc, fallback="no cultures")
+            _cultures = {}
+    return _cultures
+
+
+def culture(short):
+    """A culture prepared for drawing: its title, region, credits, and
+    `figures` as constellation records (english and native names, an
+    `iau` code where the culture keeps the IAU figure, the label point
+    and the lines as equatorial unit vectors), `star_names` as
+    {index: (english, native)}, and `variants`, the native names again
+    in another script where the data carries them ({lang: {"figures":
+    [name, …], "star_names": {index: name}}}). None for a name the data
+    lacks."""
+    if short in _culture_cache:
+        return _culture_cache[short]
+    raw = _load_cultures().get(CULTURES.get(short, short))
+    if raw is None:
+        return None
+
+    def vec(pair):
+        ra, dec = pair
+        return equatorial_vector(math.radians(ra / 100.0), math.radians(dec / 100.0))
+
+    prepared = {
+        "id": short, "title": raw["title"], "region": raw["region"],
+        "native_lang": raw["native_lang"], "fallback": raw["fallback"],
+        "authors": raw["authors"], "license": raw["license"],
+        "figures": [{
+            "id": f"{short}:{i}", "english": c["english"], "native": c["native"],
+            "iau": c.get("iau"), "at": vec(c["at"]),
+            "lines": [[vec(p) for p in line] for line in c["lines"]],
+        } for i, c in enumerate(raw["constellations"])],
+        "star_names": {int(k): tuple(v) for k, v in raw["star_names"].items()},
+        "variants": {lang: {"figures": v["constellations"],
+                            "star_names": {int(k): n for k, n in v["star_names"].items()}}
+                     for lang, v in raw.get("variants", {}).items()},
+    }
+    _culture_cache[short] = prepared
+    return prepared
+
+
+def culture_for(short, lang):
+    """The culture as *lang* reads it: with the native names in that
+    language's script where the data has them (the Chinese sky in the
+    traditional characters), so the picking below sees one native form
+    and one native language; the culture as prepared otherwise."""
+    prepared = culture(short)
+    script = lang if prepared is None or lang in prepared["variants"] else base_language(lang)
+    if prepared is None or script not in prepared["variants"]:
+        return prepared
+    key = (short, lang)
+    if key not in _culture_cache:
+        variant = prepared["variants"][script]
+        _culture_cache[key] = {
+            **prepared, "native_lang": lang,
+            "figures": [{**fig, "native": name or fig["native"]}
+                        for fig, name in zip(prepared["figures"], variant["figures"])],
+            "star_names": {i: (english, variant["star_names"].get(i) or native)
+                           for i, (english, native) in prepared["star_names"].items()},
+        }
+    return _culture_cache[key]
+
+
+def culture_title(short, lang="en"):
+    """The culture's name in the display language: the translation table's
+    where it has one, else the English title from the data."""
+    from linecast.sky.i18n import culture_title_text
+    text = culture_title_text(short, lang)
+    if text:
+        return text
+    prepared = culture(short)
+    return prepared["title"] if prepared else short
+
+
+def _pick(english, native, native_lang, lang):
+    """Which of a culture's two names to show: the native one where the
+    display language is the culture's own, or where there is no English;
+    the English one otherwise, and where the culture has no language of
+    its own and no native form. A name the culture never gave a native
+    form falls back to the English one either way."""
+    if native_lang:
+        if lang == native_lang:
+            return native or english
+        return english or native
+    return native or english
+
+
+def figures_for(short, lang):
+    """The constellation records to draw for a culture, in the shape of
+    `constellations()` plus the label text in `name` and the other form of
+    the name in `detail`: an IAU figure keeps its localized name."""
+    prepared = culture_for(short, lang)
+    if prepared is None:
+        return []
+    iau = {r["id"]: r for r in constellations()}
+    out = []
+    for fig in prepared["figures"]:
+        native_lang = prepared["native_lang"]
+        if fig["iau"] and fig["iau"] in iau and not (native_lang and lang == native_lang
+                                                     and fig["native"]):
+            name = record_name(iau[fig["iau"]], lang)
+            detail = fig["native"] or fig["english"]
+        else:
+            name = _pick(fig["english"], fig["native"], native_lang, lang)
+            detail = fig["native"] if name == fig["english"] else fig["english"]
+        if not name:
+            continue
+        out.append({"id": fig["id"], "iau": fig["iau"], "name": name, "gen": "",
+                    "names": {}, "detail": detail if detail != name else "",
+                    "at": fig["at"], "lines": fig["lines"]})
+    return out
+
+
+def names_for(short, lang):
+    """{index: (name, designation)} for a culture: its own star names,
+    with the IAU names behind them where the culture asks for that
+    fallback. The designation stays the IAU one, so the chip can say
+    which star a name belongs to."""
+    prepared = culture_for(short, lang)
+    if prepared is None:
+        return star_names()
+    iau = star_names()
+    out = dict(iau) if prepared["fallback"] else {}
+    for index, (english, native) in prepared["star_names"].items():
+        name = _pick(english, native, prepared["native_lang"], lang)
+        if name:
+            out[index] = (name, iau.get(index, ("", ""))[1])
+    return out

@@ -1,0 +1,428 @@
+"""Pluggable radar sources behind one small contract.
+
+A source exposes:
+  .label / .attribution   — footer text (.model_attribution, if present,
+                            replaces it where has_radar() is false)
+  .current_frames()       — ordered Frame list, oldest → newest (may include
+                            forecast frames flagged .future)
+  .frame_rgba(bbox, gw, hc, frame) → (pw, ph, rgba)  at gw × hc*2, EPSG:4326
+
+Region routing: LibreWXR is primary everywhere — real radar composites for
+North America / Europe / East Asia, model precipitation elsewhere, nowcast
+frames, and selectable colour themes.  On failure, the continental US falls
+back to IEM/NEXRAD (deep 3h history, native projection) and the rest of the
+world to RainViewer, with IEM as the last resort.  A host that answers
+its index and then stalls on the tiles is stepped over the same way, once
+a frame has come back short (see demote).  RainViewer keeps the
+locally-coloured themes, its Universal Blue tiles decoded back to
+reflectivity first (ub); of the server schemes it can only ever
+show universal-blue.
+
+(RainViewer also composites IMD's Indian radar, which LibreWXR lacks, and
+for a moment led there — but its IMD frames animate badly: stations on a
+slower scan cadence sit frozen across the 10-minute composites and blink
+in and out, and the free tier has no nowcast.  LibreWXR's model, coherent
+and an hour ahead, reads better.  See issue #40 before trying that again.)
+"""
+
+import datetime
+import threading
+import time
+from typing import Any
+
+from linecast.radar.iem import fetch_frame, frame_times, latest_frame_time, settled
+from linecast.radar import tiles
+from linecast.radar import palettes
+from linecast.radar import ub
+from linecast._log import log_failure
+
+# rough lower-48 bounding box; IEM/NEXRAD coverage
+_CONUS = (-127.0, 23.0, -65.0, 50.0)
+
+_REFRESH_S = 60  # how long a tile source trusts its frame list
+
+# Called from the refresh thread when a background index refresh changes
+# the frame list; the live radar hangs a repaint nudge here.
+on_index_refresh = None
+
+# Colour themes in picker display order: ours first, then the server's.
+# A str names one of our own palettes, coloured here from the grayscale
+# scheme; an int is a LibreWXR server-rendered scheme (the tile-path
+# colour id).
+THEMES: dict[str, str | int] = {
+    "terminal": "terminal",
+    "dusk": "dusk",
+    "ember": "ember",
+    "ink": "ink",
+    "marangai": "marangai",
+    "dark-sky": 8,
+    "universal-blue": 2,
+    "rainbow": 7,
+    "nexrad": 6,
+    "original": 1,
+    "titan": 3,
+    "twc": 4,
+    "meteored": 5,
+    "datameteo": 9,
+    "viper": 10,
+    "mrms": 11,
+    "max-storm": 12,
+    "black-white": 0,
+}
+DEFAULT_THEME = "terminal"
+# (universal-blue is the palette we rendered before LibreWXR)
+
+
+def is_local(theme: str | int) -> bool:
+    """True for a theme coloured here rather than on the tile server."""
+    return isinstance(theme, str)
+
+
+# RainViewer's free tier serves Universal Blue whatever colour id the URL
+# asks for, so its picker offers our own palettes — decoded from those
+# tiles, see ub — and universal-blue itself.
+RV_THEMES: dict[str, str | int] = {
+    name: v for name, v in THEMES.items() if is_local(v)}
+RV_THEMES["universal-blue"] = THEMES["universal-blue"]
+
+
+def theme_id(value: str | int | None) -> str | int | None:
+    """Resolve a theme name or bare numeric id to a theme id, or None."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in THEMES:
+        return THEMES[text]
+    try:
+        num = int(text)
+    except ValueError:
+        return None
+    return num if num in THEMES.values() else None
+
+
+# Where LibreWXR composites real radar (rough boxes, from its source list:
+# MRMS/ECCC, OPERA + DINI, JMA, CWA, MET Malaysia, PAGASA, MARN).  Outside
+# these it serves model-derived precipitation, which is smoother and coarser
+# than radar, and the footer should say so.
+_RADAR_REGIONS = (
+    (-170.0, 24.0, -52.0, 72.0),   # United States and Canada
+    (-25.0, 34.0, 45.0, 72.0),     # Europe
+    (122.0, 24.0, 150.0, 46.0),    # Japan
+    (118.0, 21.0, 123.0, 26.0),    # Taiwan
+    (99.0, 0.5, 120.0, 8.0),       # Malaysia, Singapore, Brunei
+    (116.0, 4.0, 127.0, 21.0),     # Philippines
+    (-91.0, 12.5, -87.0, 15.0),    # El Salvador
+)
+
+
+def has_radar(lat: float, lon: float) -> bool:
+    """True where LibreWXR's frames come from radar rather than a model."""
+    return any(w <= lon <= e and s <= lat <= n
+               for w, s, e, n in _RADAR_REGIONS)
+
+def _in_conus(lat, lon):
+    w, s, e, n = _CONUS
+    return w <= lon <= e and s <= lat <= n
+
+
+class Frame:
+    """One radar frame: a UTC time, a source-specific token, past-or-future."""
+    __slots__ = ("time", "token", "future")
+
+    time: datetime.datetime
+    token: Any
+    future: bool
+
+    def __init__(self, time: datetime.datetime, token: Any,
+                 future: bool = False) -> None:
+        self.time = time
+        self.token = token
+        self.future = future
+
+
+class IEMSource:
+    label = "NEXRAD · IEM"
+    attribution = "NEXRAD · IEM"
+    kind = "iem"
+    tag = "radar/iem"  # the source's name in the debug log
+
+    def __init__(self, n_frames: int) -> None:
+        self.n_frames = n_frames
+
+    def current_frames(self) -> list[Frame]:
+        # Timestamps are cheap to recompute, so newer frames appear live.
+        # A frame IEM may not have composited yet is listed under the
+        # window it is in as well, so the next window, a step later,
+        # asks for it again instead of keeping an empty answer for good.
+        end = latest_frame_time()
+        return [Frame(t, t if settled(t) else (t, end))
+                for t in frame_times(self.n_frames, end)]
+
+    def frame_rgba(self, bbox: tuple[float, float, float, float], gw: int, hc: int,
+                   frame: Frame) -> tuple[int, int, bytearray]:
+        return fetch_frame(bbox, gw, hc * 2, frame.time)
+
+
+class _TileSource:
+    """Shared body for sources speaking the RainViewer v2 tile protocol.
+
+    The first index fetch is synchronous (a source with no frames is no
+    source). After that the frame list refreshes in a background thread
+    once it is _REFRESH_S old, and the stale list is served meanwhile, so
+    a render never waits on the network for the index.
+    """
+
+    tag: str  # the source's name in the debug log, set by each source
+    host: str | None
+    _frames: list[Frame]
+    _sat_frames: list[Frame]
+
+    def __init__(self, provider: tiles.Provider,
+                 index_from: "_TileSource | None" = None) -> None:
+        self.provider = provider
+        self._sat_provider = tiles.satellite_provider(provider)
+        self.host = None
+        self._frames = []
+        self._sat_frames = []
+        self._checked_at = 0.0
+        self._refresh_lock = threading.Lock()
+        self._refreshing = False
+        if index_from is not None:
+            # same index under other settings (a theme switch): no network
+            self.host = index_from.host
+            self._frames = index_from._frames
+            self._sat_frames = index_from._sat_frames
+            self._checked_at = index_from._checked_at
+        else:
+            self._refresh()
+
+    def _refresh(self):
+        """Fetch the index and rebuild the frame lists. Returns True when
+        the radar frame list changed."""
+        idx = tiles.fetch_index(self.provider)
+        radar = idx.get("radar", {})
+        frames = []
+        for f in radar.get("past") or []:
+            frames.append(Frame(_utc(f["time"]), f["path"], False))
+        for f in radar.get("nowcast") or []:
+            frames.append(Frame(_utc(f["time"]), f["path"], True))
+        frames.sort(key=lambda fr: fr.time)
+        # hourly global cloud mosaic; absent from indexes without satellite
+        sat = (idx.get("satellite") or {}).get("infrared") or []
+        sat_frames = sorted(
+            (Frame(_utc(f["time"]), f["path"], False) for f in sat),
+            key=lambda fr: fr.time)
+        changed = ([(f.time, f.token) for f in frames]
+                   != [(f.time, f.token) for f in self._frames])
+        # whole-list assignments: a reader on another thread sees either
+        # the old list or the new one, never a half-built one
+        self.host = idx["host"]
+        self._frames = frames
+        self._sat_frames = sat_frames
+        self._checked_at = time.time()
+        return changed
+
+    def _refresh_in_background(self):
+        with self._refresh_lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def work():
+            changed = False
+            try:
+                changed = self._refresh()
+            except Exception as exc:
+                log_failure(self.tag, "index refresh", exc, url=self.provider.index_url,
+                            fallback="stale frame list kept")
+            finally:
+                with self._refresh_lock:
+                    self._refreshing = False
+                    self._checked_at = time.time()  # a failure backs off too
+            hook = on_index_refresh
+            if changed and hook is not None:
+                hook()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def current_frames(self) -> list[Frame]:
+        if time.time() - self._checked_at > _REFRESH_S:
+            self._refresh_in_background()
+        return self._frames
+
+    def satellite_frames(self) -> list[Frame]:
+        self.current_frames()  # shares the index refresh
+        return self._sat_frames
+
+    smooth = False     # bilinear resample; only right for raw gray tiles
+    palette = None     # a local palette to colour scheme-0 gray through
+    transform = None   # rewrites each decoded tile to scheme-0 gray first
+
+    def frame_rgba(self, bbox: tuple[float, float, float, float], gw: int, hc: int,
+                   frame: Frame) -> tuple[int, int, bytearray]:
+        w, h, rgba = tiles.reproject(self.provider, self.host, frame.token,
+                                     bbox, gw, hc * 2, mutable=frame.future,
+                                     smooth=self.smooth,
+                                     transform=self.transform)
+        if self.palette is not None:
+            palettes.apply(rgba, self.palette)
+        return w, h, rgba
+
+    def satellite_rgba(self, bbox: tuple[float, float, float, float], gw: int, hc: int,
+                       frame: Frame) -> tuple[int, int, bytearray]:
+        return tiles.reproject(self._sat_provider, self.host, frame.token,
+                               bbox, gw, hc * 2)
+
+
+class RainViewerSource(_TileSource):
+    label = "RainViewer"
+    attribution = "Weather data by RainViewer"
+    kind = "rv"
+    tag = "radar/rainviewer"
+    themes = RV_THEMES  # advertises the in-radar theme picker
+
+    def __init__(self, theme: str | int = THEMES[DEFAULT_THEME],
+                 index_from: _TileSource | None = None) -> None:
+        self.theme = theme
+        self.palette = palettes.PALETTES.get(theme)
+        self.smooth = self.palette is not None
+        # a local palette wants the exact table colours to decode; a
+        # server theme can only ever be Universal Blue here, smoothed
+        self.transform = ub.to_gray if self.palette is not None else None
+        super().__init__(tiles.rainviewer_provider(smooth=self.palette is None),
+                         index_from=index_from)
+
+    def with_theme(self, theme: str | int) -> "RainViewerSource":
+        """This source's index under another theme; never touches the network."""
+        return RainViewerSource(theme, index_from=self)
+
+
+class LibreWXRSource(_TileSource):
+    label = "LibreWXR"
+    attribution = "Weather data by LibreWXR · CC BY 4.0"
+    model_attribution = "Precipitation model by LibreWXR (no radar here) · CC BY 4.0"
+    kind = "lwxr"
+    tag = "radar/librewxr"
+    themes = THEMES  # advertises the in-radar theme picker
+
+    def __init__(self, theme: str | int = THEMES[DEFAULT_THEME],
+                 index_from: _TileSource | None = None) -> None:
+        self.theme = theme
+        self.palette = palettes.PALETTES.get(theme)
+        self.smooth = self.palette is not None
+        super().__init__(tiles.librewxr_provider(
+            theme if self.palette is None else tiles.RAW_COLOR,
+            smooth=self.palette is None), index_from=index_from)
+
+    def with_theme(self, theme: str | int) -> "LibreWXRSource":
+        """This source's index under another theme; never touches the network."""
+        return LibreWXRSource(theme, index_from=self)
+
+
+def _utc(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+
+
+# Set from radar --source: pins one source instead of routing by
+# location, so what each shows can be compared over the same spot.
+FORCED_SOURCE: str | None = None  # "librewxr" | "rainviewer" | "iem"
+
+
+def _forced_source(n_frames, theme):
+    """The source --source pinned, IEM standing in when it won't answer."""
+    if FORCED_SOURCE != "iem":
+        cls = (LibreWXRSource if FORCED_SOURCE == "librewxr"
+               else RainViewerSource)
+        try:
+            src = cls(theme)
+            if src.current_frames():
+                return src
+        except Exception as exc:
+            log_failure(cls.tag, "pinned source", exc, fallback="IEM")
+    return IEMSource(n_frames)
+
+
+# What get_source last routed, so demote() can pick up the chain where
+# the source in hand left off without being handed the location again.
+_routing: tuple[float, float, int] | None = None
+
+def _chain(lat: float, lon: float) -> list[str]:
+    """The sources to try for a location, best first."""
+    kinds = ["lwxr"]
+    if not _in_conus(lat, lon):
+        kinds.append("rv")   # IEM has only the lower 48
+    kinds.append("iem")
+    return kinds
+
+
+# LibreWXR's and RainViewer's indexes come back in well under a second.
+# A source that has kept us this long gets the next one's index asked
+# beside its own, so a network that has stopped answering costs one
+# index's timeout rather than one for each source in turn; the chain's
+# order still decides which answer is taken.
+_HEDGE_S = 2.0
+
+
+def _tile_class(kind):
+    return LibreWXRSource if kind == "lwxr" else RainViewerSource
+
+
+def _first_answering(kinds, n_frames, theme):
+    """The first source in `kinds` that hands back a frame list."""
+    from concurrent.futures import wait
+
+    from linecast._fanout import Fanout
+
+    tiled = []
+    for kind in kinds:
+        if kind == "iem":
+            break   # no index to fail on: it answers wherever it stands
+        tiled.append(kind)
+    fanout = Fanout()
+    asked = {}
+    for i, kind in enumerate(tiled):
+        if kind not in asked:
+            asked[kind] = fanout.submit(_tile_class(kind), theme)
+        if i + 1 < len(tiled) and not wait([asked[kind]], _HEDGE_S).done:
+            asked[tiled[i + 1]] = fanout.submit(_tile_class(tiled[i + 1]), theme)
+        try:
+            src = asked[kind].result()
+            if src.current_frames():
+                return src
+        except Exception as exc:
+            log_failure(_tile_class(kind).tag, "source", exc, fallback="next source")
+    return IEMSource(n_frames)
+
+
+def get_source(lat: float, lon: float, n_frames: int, theme: str | int | None = None
+               ) -> LibreWXRSource | RainViewerSource | IEMSource:
+    """Pick the best source for a location, falling back on failure."""
+    global _routing
+    if theme is None:
+        theme = THEMES[DEFAULT_THEME]
+    _routing = (lat, lon, n_frames)
+    if FORCED_SOURCE is not None:
+        return _forced_source(n_frames, theme)
+    return _first_answering(_chain(lat, lon), n_frames, theme)
+
+
+def demote(src) -> "LibreWXRSource | RainViewerSource | IEMSource | None":
+    """The next source down the chain from `src`, or None if there is none.
+
+    For a tile host that answers its index and then cannot serve the
+    tiles: every frame comes back short and the window stays empty, and
+    nothing in the index says so.  A source the user pinned with
+    --source is left where they put it.
+    """
+    if FORCED_SOURCE is not None or _routing is None:
+        return None
+    lat, lon, n_frames = _routing
+    kinds = _chain(lat, lon)
+    kind = getattr(src, "kind", None)
+    if kind not in kinds:
+        return None
+    rest = kinds[kinds.index(kind) + 1:]
+    if not rest:
+        return None
+    return _first_answering(rest, n_frames,
+                            getattr(src, "theme", THEMES[DEFAULT_THEME]))

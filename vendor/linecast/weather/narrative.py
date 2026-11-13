@@ -1,0 +1,2283 @@
+"""The prose under the graph: what the next hours and days will bring,
+in a sentence or two (narrative_lines, narrative_text).
+
+narrative_text writes the paragraph, and narrative_lines wraps it for
+the dashboard.  They read three things.  `data` is the forecast as
+weather/forecast.py fetched it, Open-Meteo's dict with its current,
+hourly and daily blocks.  Before it gets here, observed.py may have put
+a nearby station's sky in `current`, noting the station under
+current["observed"], and the station's gauge for the last day beside it
+in data["observed_precipitation"]; humidex.py may have added Canada's
+humidex and wind chill.  `now` is the local time at the place as a
+naive datetime, on the same clock as the forecast's hour stamps.  The
+runtime gives the language, the units and the clock.  The hour we are
+in is read as the station saw it, where there is one (_observed_hour),
+so the paragraph starts from what the header shows.
+
+Each kind of sentence has a builder: a function that returns the
+sentence, or "" when it has nothing to say, and usually the hour the
+sentence is about.  narrative_text calls the builders in the order
+below and hands each to add(), which keeps it as a candidate with:
+
+- its salience, a small whole number for how sure a person would be to
+  mention it;
+- the time it is about, in hours from now, which sets where it reads;
+- its anchor, the hour it is about, and the last hour it names, which
+  is the anchor unless it names a later one;
+- a function that builds its text, given `after`, and its place in the
+  order the candidates were added.
+
+A candidate is kept as a function rather than as its text, because the
+words of a sentence can depend on the one before it.  narrative_text
+calls a builder once up front, to learn whether it has anything to say
+and which hour it is about; add() calls the candidate's function with
+after=None, keeps it only if it says something, and records that text
+for the trace; and the chosen ones are called again as the paragraph is
+written.  So a builder that takes `after` can run three times for one
+paragraph, and must have no effect beyond what it returns.  A sentence
+whose words never depend on the one before it (the feeling now, today's
+comparison, the snow, the week's turn) is built once, and its function
+only hands it back.
+
+The builders are called in this order:
+
+1. Precipitation in the next 24 hours: falling and going on, falling
+   and ending, or starting (_precip_parts).  Gusts in the same part of
+   the day ride on its sentence ("with_gusts") where the language has
+   the form, and the sentence takes the higher salience of the two;
+   otherwise the strongest gusts in the 24 hours are a candidate of
+   their own (_gusts).
+2. More precipitation within the 24 hours, after a break of three hours
+   or more (more_later_sentence).
+3. The snow on the ground when the snow stops (_snow_sentence).
+4. Why it feels warmer or colder now than the thermometer reads
+   (_feels), unless the sentence about the felt temperature ahead names
+   the same cause.
+5. Before 14:00, today's high against yesterday's, and tomorrow's high
+   when that is a change (_comparison, _high_tomorrow).  From 14:00,
+   tomorrow's high against today's, placed at noon tomorrow.
+6. Fog in the day ahead, and when it lifts (_fog).
+7. A lasting change in the sky, unless there is fog (_sky).
+8. A freeze tonight (_freeze).
+9. The felt temperature at the hottest or coldest hour ahead, when it
+   is extreme (_feels_ahead).
+10. A turn in the week's highs after tomorrow (_highs_turn).
+11. The next rain in the week, when none falls in the next 24 hours
+    (_next_rain).
+12. What fell in the last day (past_precip_sentence).
+
+The paragraph takes at most _MAX_SENTENCES of the candidates.  They are
+ranked by salience, highest first; of two with the same salience, the
+one about the sooner time is taken, and of two about the same time, the
+one added first.  Salience is what a person would be sure to mention:
+
+- 5: heavy or freezing precipitation, a gale (gusts of 60 km/h or
+  more), 10 cm of snow or more;
+- 4: other precipitation, less snow, fog, a freeze tonight, the felt
+  temperature ahead;
+- 3: gusts short of a gale, more later, the feeling now, a change in
+  the sky, a big change in today's or tomorrow's high;
+- 2: a smaller change in the high or none, tomorrow's high otherwise, a
+  big turn in the week's highs, the next rain, the last day's rain;
+- 1: a smaller turn in the week's highs.
+
+The comparison is what most people open the app for -- will it be like
+today out there, or not -- so it keeps its salience of 2 when the
+answer is "about the same".  A turn in the week's highs is said when
+there is room for it, unless it is a big one.
+
+The chosen sentences are then put in the order of the things they
+describe: now, later today, tonight, tomorrow, the week.  What fell in
+the last day is a footnote at the end.  The feeling now goes just ahead
+of the comparison about today: after "Today's high", "the humidity is
+making it feel warmer" would read as though it were about the high.
+
+As the paragraph is written, a sentence about the same later day as the
+one before it is passed that sentence's last hour as `after`, and
+_time_phrase and _period_phrase leave out the second "tomorrow": "Gusts
+to 40 km/h tomorrow morning.  It will be 3° cooler than today."  A
+sentence that names the same part of today as the one before it says
+the language's word for "then" instead (_part_of_day, through the _SAID
+context variable, which _said_in sets for each sentence).  The
+language's sentence_join and sentence_end put in the full stops.
+
+To add a sentence:
+
+1. Write its builder.  It takes `after=None` and returns its text, ""
+   when it has nothing to say, and the hour it is about.  It names an
+   hour with _time_phrase, or a part of the day with _period_phrase,
+   and passes them `after`.
+2. Put its template in the WEATHER table of locales/en.py, and of each
+   language that has the words.  The builder checks _has(key, runtime)
+   first and says nothing without it: an English sentence in a
+   paragraph in another language reads as a mistake.
+3. Call it from narrative_text, and hand it to add(salience,
+   hours(anchor), anchor, lambda after: ..., leaves=...) at the place in
+   the order above where it should win a tie.
+4. Test it in tests/test_weather_narrative.py.  `linecast prose --trace`
+   reads a frozen set of real forecasts and lists every candidate for
+   each, with its salience, its time and whether it was chosen.
+
+The public *_sentence functions (feels_sentence, sky_sentence and the
+rest) each build one kind of sentence on its own, with no sentence
+before it, so the tests can check one kind at a time.
+comparative_sentence is also the "summary" in weather --json.
+"""
+
+import contextvars
+import functools
+import math
+from datetime import datetime, timedelta
+
+from linecast.terminal import theme as _theme
+from linecast._i18n import (
+    base_language, fallbacks, fmt_decimal, has_text, lang_of, plural_category,
+    sentence_24h,
+    table_for,
+)
+from linecast.terminal.color import RESET
+from linecast.terminal.textwidth import visible_len
+from linecast._runtime import WeatherRuntime, current_runtime
+from linecast._log import log_skipped
+from linecast.terminal.textwidth import wrap_display_width
+from linecast.weather.cover import _PRECIP_CODES
+from linecast.weather.i18n import (
+    _precip_s, DAY_SPAN_FORMS, ON_DAY_FORMS, ON_FULL_DAY_FORMS, PRECIP_RUN_DESCS_I18N,
+    felt_index, _PRECIP_DESCS_I18N, _PRECIP_PARTITIVES_I18N, _STRINGS, _s, wind_unit_label,
+)
+from linecast._i18n import DAY_NAMES, FULL_DAY_NAMES
+from linecast.weather.style import TEXT
+from linecast.weather.forecast import _at
+
+
+# ---------------------------------------------------------------------------
+# The prose lines under the graph
+# ---------------------------------------------------------------------------
+def _prose(sentence):
+    """A sentence as a dashboard line, in the full text color like the day
+    names and the conditions at the top, or nothing when there is no
+    sentence."""
+    return f"{TEXT}{sentence}{RESET}" if sentence else ""
+
+
+def _has(key, runtime):
+    """Whether the display language carries `key` in its own words.
+
+    A sentence the language has not been given yet is left unsaid rather
+    than said in English: the paragraph is prose, and a line of another
+    language in it would read as a mistake.  The English table is the
+    reference, so English has everything."""
+    return has_text(_STRINGS, key, lang_of(runtime))
+
+
+def _degrees(n, runtime, signed=False):
+    """A number of degrees as the prose writes it: "8°", "8度", "8 grader",
+    "3 stupně".  A difference is unsigned; a temperature keeps its sign.
+
+    Languages whose word for degree changes with the number carry the
+    forms as variants of "degrees": "_one" for one, "_few" for the
+    Slavic two to four, "_many" for Romanian's twenty and up, and
+    "_diff" (with its own "_one") for a difference, which Icelandic puts
+    in the dative."""
+    value = round(n) if signed else round(abs(n))
+    digits = f"{value}".replace("-", "−")
+    if not _has("degrees", runtime):
+        return digits + "°"
+    base = "degrees_diff" if not signed and _has("degrees_diff", runtime) else "degrees"
+    key = base + _number_form(abs(value), runtime, base)
+    return _s(key, runtime, n=digits)
+
+
+def _number_form(count, runtime, base):
+    """The variant suffix a count takes in the display language, among
+    the variants the language has for `base`: its plural category's
+    ("_one", "_few", "_many") where the table has that form, else none.
+    The language's plural rule decides, as it does for every other
+    count: Romanian's 101 is "101 grade", not "101 de grade"."""
+    suffix = "_" + plural_category(runtime.lang, count)
+    return suffix if _has(base + suffix, runtime) else ""
+
+
+def _prose_sep(runtime):
+    """The space between a number and its unit in a sentence: the
+    language's "metric_unit_sep_prose" where running text spaces a unit
+    that the compact figures elsewhere do not ("12 mm of rain", but
+    "12mm" under the chart), and its "metric_unit_sep" otherwise."""
+    if _has("metric_unit_sep_prose", runtime):
+        return _s("metric_unit_sep_prose", runtime)
+    return _s("metric_unit_sep", runtime)
+
+
+def _prose_inches(n, runtime):
+    """A number of inches as a sentence writes it: "3 inches" where the
+    language spells the unit out, "3″" where it keeps the mark."""
+    if _has("precip_inch_prose", runtime):
+        return _s("precip_inch_prose", runtime, n=n)
+    return f"{n}{_s('precip_inch', runtime)}"
+
+
+# How many sentences the paragraph carries; the module docstring says
+# how they are chosen and in what order they read.
+_MAX_SENTENCES = 4
+
+
+def narrative_lines(data, now, width, runtime=None, trace=None):
+    """The prose under the graph, wrapped as one continuous paragraph."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    text = narrative_text(data, now, runtime, trace)
+    if not text:
+        return []
+    budget = max(1, width)
+    rows = wrap_display_width(text, budget)
+    # Give a lone final word some company when it fits, without adding a
+    # row or leaving another lone word behind.  Languages without spaces
+    # keep the display-width wrapper's natural breaks.
+    if len(rows) > 1 and len(rows[-1].split()) == 1:
+        before, space, word = rows[-2].rpartition(" ")
+        last = word + " " + rows[-1]
+        if space and len(before.split()) > 1 and visible_len(last) <= budget:
+            rows[-2:] = [before, last]
+    return [_prose(line) for line in rows]
+
+
+def narrative_text(data, now, runtime=None, trace=None):
+    """The prose under the graph as one paragraph of plain text, or ""
+    when there is nothing to say.
+
+    `trace`, a list, collects every candidate sentence as a dict of its
+    salience, hours from now, text, and whether it was chosen: how
+    `linecast prose` shows why a paragraph says what it says."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    daily = data.get("daily", {})
+    current = data.get("current", {})
+    hourly = _observed_hour(data.get("hourly", {}), current, now)
+
+    # Each candidate is a sentence builder rather than a sentence, so a
+    # sentence can be told what the one before it established: a
+    # paragraph says "tomorrow" once and then carries it.
+    candidates = []    # (salience, hours from now, anchor, build, rank, leaves)
+
+    def hours(dt):
+        return (dt - now).total_seconds() / 3600
+
+    def add(salience, at, anchor, build, leaves=None):
+        # `leaves` is the last time the sentence names, the frame the
+        # next sentence can inherit; by default the anchor itself
+        text = build(None)
+        if text:
+            candidates.append((salience, at, anchor, build, len(candidates),
+                               leaves or anchor))
+            if trace is not None:
+                trace.append({"salience": salience, "at": at, "text": _ucfirst(text),
+                              "chosen": False})
+
+    precip = _precip_parts(hourly, now, runtime, daily, current=current)
+    kind = precip["kind"]
+    anchor = precip["run"][0][1] if kind == "starting" else now
+    at = hours(anchor) if kind == "starting" else -1.0
+    gusts, gale, gust_at, gust_speed = _gusts(hourly, now, runtime, daily=daily)
+    if (gusts and precip["sentence"] and kind != "ending" and _has("with_gusts", runtime)
+            and _period_phrase(gust_at, now, runtime) == _period_phrase(anchor, now, runtime)):
+        # Wind in the same part of the day rides on the rain's sentence
+        add(max(precip["salience"], 5 if gale else 3), at, anchor,
+            lambda after: _s(
+                "with_gusts", runtime, speed=gust_speed,
+                sentence=_precip_parts(hourly, now, runtime, daily, after,
+                                       current)["sentence"]),
+            leaves=precip["last_named"])
+    else:
+        add(precip["salience"], at, anchor,
+            lambda after: _precip_parts(hourly, now, runtime, daily, after,
+                                        current)["sentence"],
+            leaves=precip["last_named"])
+        if gusts:
+            add(5 if gale else 3, hours(gust_at), gust_at,
+                lambda after: _gusts(hourly, now, runtime, after, daily)[0])
+    if precip["next"]:
+        add(3, hours(precip["next"][1]), precip["next"][1],
+            lambda after: more_later_sentence(precip, now, runtime, after))
+    snow, heavy = _snow_sentence(precip, hourly, now, runtime)
+    add(5 if heavy else 4, at + 0.01, anchor, lambda after: snow)
+
+    comparison, big = _comparison(daily, now, runtime)
+    feels, feels_cause = _feels(current, daily, now, runtime)
+    ahead, ahead_at, ahead_cause = _feels_ahead(hourly, now, runtime, current=current)
+    if ahead and ahead_cause == feels_cause:
+        # One sentence about the felt temperature: the one that looks ahead
+        feels = ""
+    add(3, 0.0, now, lambda after: feels)
+    if now.hour < _COMPARISON_TURNS_TO_TOMORROW:
+        add(big, 0.01, now, lambda after: comparison)
+        # The comparison is still looking back, so a change tomorrow has
+        # a sentence of its own
+        high, high_big, high_at = _high_tomorrow(daily, hourly, now, runtime)
+        if high:
+            add(high_big, hours(high_at), high_at,
+                lambda after: _high_tomorrow(daily, hourly, now, runtime, after)[0])
+    else:
+        noon_tomorrow = (now + timedelta(days=1)).replace(hour=12, minute=0, second=0,
+                                                          microsecond=0)
+        add(big, hours(noon_tomorrow), noon_tomorrow,
+            lambda after: _comparison(daily, now, runtime, after is not None)[0])
+
+    fog, fog_at, fog_end = _fog(hourly, current, now, runtime, daily=daily)
+    if fog:
+        add(4, hours(fog_at), fog_at,
+            lambda after: _fog(hourly, current, now, runtime, after, daily)[0],
+            leaves=fog_end)
+    sky, sky_at = _sky(hourly, now, runtime, kind, precip["end"])
+    # Fog is the sky.  Once the fog sentence has spoken, a sentence about
+    # the cloud would say the same change over again -- the fog closing
+    # in, or lifting -- in words that read as though it were something else.
+    if sky and not fog:
+        add(3, hours(sky_at), sky_at,
+            lambda after: _sky(hourly, now, runtime, kind, precip["end"], after)[0])
+    freeze, freeze_at = _freeze(hourly, current, now, runtime)
+    if freeze:
+        add(4, hours(freeze_at), freeze_at,
+            lambda after: _freeze(hourly, current, now, runtime, after)[0])
+    if ahead:
+        add(4, hours(ahead_at), ahead_at,
+            lambda after: _feels_ahead(hourly, now, runtime, after, current)[0])
+    turn, turn_big, turn_at, turn_end = _highs_turn(daily, now, runtime)
+    if turn:
+        add(turn_big, hours(turn_at), turn_at, lambda after: turn, leaves=turn_end)
+    if not kind:
+        week, week_at = _next_rain(daily, now, runtime, hourly)
+        if week:
+            add(2, hours(week_at), week_at,
+                lambda after: _next_rain(daily, now, runtime, hourly, after)[0])
+    # The last day is the station's gauge where it has one, else the
+    # model's hours as they came: this hour's stamp holds what fell in the
+    # hour before it, which the station's weather now does not name
+    add(2, float("inf"), None,
+        lambda after: past_precip_sentence(data.get("hourly", {}), now, runtime,
+                                           data.get("observed_precipitation")))
+
+    if not candidates:
+        return ""
+
+    chosen = sorted(candidates, key=lambda c: (-c[0], c[1], c[4]))[:_MAX_SENTENCES]
+    chosen.sort(key=lambda c: (c[1], c[4]))
+    if trace is not None:
+        for _, _, _, _, rank, _ in chosen:
+            trace[rank]["chosen"] = True
+
+    # A sentence about the same later day as the one before it inherits
+    # that day: "Gusts to 40 km/h tomorrow morning.  It will be 3° cooler
+    # than today."  Today needs no such care; its phrases do not name it.
+    sentences = []
+    previous = None
+    said = set()
+    for _, _, anchor, build, _, leaves in chosen:
+        after = None
+        if (previous is not None and anchor is not None
+                and anchor.date() == previous.date() and _names_the_day(previous, now)):
+            after = previous
+        said = _said_in(functools.partial(build, after), said, sentences)
+        previous = leaves if leaves is not None else previous
+
+    # Read as prose, so the sentences are punctuated as prose: a full stop
+    # between sentences and at the end of the paragraph.  Which mark
+    # that is, and whether a space follows it, is the language's business.
+    return _s("sentence_join", runtime).join(sentences) + _s("sentence_end", runtime)
+
+
+def _said_in(build, before, sentences):
+    """Build a sentence onto `sentences`, knowing which parts of today the
+    one before it named; return the parts this one names."""
+    now_said = set()
+    token = _SAID.set((before, now_said))
+    try:
+        sentences.append(_ucfirst(build()))
+    finally:
+        _SAID.reset(token)
+    return now_said
+
+
+# ---------------------------------------------------------------------------
+# Naming an hour
+# ---------------------------------------------------------------------------
+def _hours_ahead(hourly, now, span=24):
+    """(index, datetime) for each hour from this one to `span` hours on."""
+    times = hourly.get("time", [])
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    window = []
+    dropped = 0
+    bad = None
+    for i, t in enumerate(times):
+        try:
+            dt = datetime.fromisoformat(t)
+        except (TypeError, ValueError) as exc:
+            dropped += 1
+            bad = exc
+            continue
+        if current_hour <= dt <= current_hour + timedelta(hours=span):
+            window.append((i, dt))
+    log_skipped("weather/open-meteo", "hourly times", dropped, len(times), bad)
+    return window
+
+
+def _observed_hour(hourly, current, now):
+    """The hours with the one we are in as a nearby station saw it.
+
+    Where a station's report stands in for the model's current weather
+    (observed.py), the header shows what the station saw, and the
+    paragraph under it starts from the same: the header's light rain is
+    not the prose's drizzle, and a station that sees nothing falling
+    means no rain now, whatever the model has for the hour.  The hours
+    after this one stay the model's."""
+    code = (current or {}).get("weather_code")
+    codes = hourly.get("weather_code")
+    if not (current or {}).get("observed") or code is None or not codes:
+        return hourly
+    window = _hours_ahead(hourly, now, span=0)
+    if not window or window[0][0] >= len(codes):
+        return hourly
+    codes = list(codes)
+    codes[window[0][0]] = code
+    return dict(hourly, weather_code=codes)
+
+
+def _names_the_day(dt, now):
+    """Whether the phrase for `dt` says which day it is: "tomorrow
+    afternoon" does, "in about an hour", "overnight" and "tonight" do
+    not, even when the hour they name falls after midnight."""
+    if (dt - now).total_seconds() < 4 * 3600 or dt.date() == now.date():
+        return False
+    if dt.date() == (now + timedelta(days=1)).date():
+        return dt.hour >= 5
+    return True
+
+
+# Where one part of tomorrow ends and the next begins: the small hours
+# before the morning proper, then morning, afternoon, evening.  The
+# small hours and the morning are one morning for saying "later in" it.
+_DAY_PARTS = (8, 12, 17)
+_LATER_IN = ("morning", "morning", "afternoon", "evening")
+
+
+def _day_part(hour):
+    """Which part of the day an hour falls in, as an index into the
+    parts the phrases for tomorrow name."""
+    return sum(hour >= edge for edge in _DAY_PARTS)
+
+
+def _time_phrase(dt, now, runtime, after=None, same_sentence=False):
+    """When something happens, as a person would say it: "shortly", "around
+    3pm", "tomorrow afternoon".  With `after`, the hour named just before
+    -- in this sentence when `same_sentence`, otherwise in the one before
+    it -- a second "tomorrow" is left out: "starting tomorrow afternoon,
+    becoming rain in the evening"."""
+    lang = runtime.lang
+    delta = (dt - now).total_seconds() / 3600
+    if delta < 1.5:
+        return _s("shortly", runtime)
+    if delta < 2.5:
+        return _s("in_about_an_hour", runtime)
+    if delta < 4:
+        return _s("in_a_couple_hours", runtime)
+    if dt.date() == now.date():
+        if dt.hour == 12 and _has("around_noon", runtime):
+            return _s("around_noon", runtime)
+        from linecast._timefmt import fmt_hour_phrase
+        return _s("around", runtime,
+                  time=fmt_hour_phrase(dt.hour, sentence_24h(runtime), lang))
+    tomorrow = (now + timedelta(days=1)).date()
+    if dt.date() == tomorrow:
+        if dt.hour < 5:
+            # Read before dawn, the hours after midnight tomorrow belong
+            # to the night this evening leads into, the one the rest of
+            # the paragraph is already calling tonight.  A forecast
+            # issued at four says "tonight"; "tomorrow night" would be
+            # the night after, a day late.
+            if now.hour < 5 and _has("tonight", runtime):
+                return _part_of_day("tonight", runtime)
+            return _part_of_day("overnight", runtime)
+        said_tomorrow = (after is not None and after.date() == tomorrow
+                         and _names_the_day(after, now))
+        if dt.hour < 8:
+            key = "early_tomorrow_morning"
+        elif dt.hour < 12:
+            key = "tomorrow_morning"
+        elif dt.hour < 17:
+            key = "tomorrow_afternoon"
+        else:
+            key = "tomorrow_evening"
+        again = "then_" + key.replace("tomorrow_", "")
+        if said_tomorrow:
+            # A second hour in the part of the day this sentence has
+            # already named is later in it, not that part over again: "a
+            # chance of drizzle tomorrow morning, becoming showers later
+            # in the morning".  What one sentence hands the next is the
+            # day and not an hour to be later than -- the comparison
+            # names no hour at all -- so between sentences only the turn
+            # out of the small hours reads that way.  A language without
+            # the words for the turn names the part again rather than
+            # the day twice.
+            here, there = _day_part(dt.hour), _day_part(after.hour)
+            later = "then_later_" + _LATER_IN[here]
+            if (_LATER_IN[there] == _LATER_IN[here] and (there < here or same_sentence)
+                    and _has(later, runtime)):
+                again = later
+            if _has(again, runtime):
+                key = again
+        return _s(key, runtime)
+    day_names = table_for(DAY_NAMES, lang)
+    forms = ON_DAY_FORMS.get(lang, ON_DAY_FORMS.get(base_language(lang), {}))
+    form = forms.get(dt.weekday())
+    if form:
+        return form.format(day=day_names[dt.weekday()])
+    return _s("on_day", runtime, day=day_names[dt.weekday()])
+
+
+def _names_an_hour(dt, now):
+    """Whether _time_phrase names `dt` as a moment -- "soon", "in a
+    couple hours", "around 3pm" -- rather than a part of a day."""
+    return (dt - now).total_seconds() < 4 * 3600 or dt.date() == now.date()
+
+
+# The parts of today the paragraph has named, while it is being written:
+# (those the sentence before named, those this one has).  A sentence about
+# the same part of today as the one before it says so in the language's
+# own word, "then", rather than naming it again: "Below freezing tonight,
+# down to −2°.  Light snow likely then."  Tomorrow is carried the same way
+# by `after`; today's parts need this instead, because "tonight" names no
+# day for `after` to compare.
+_SAID = contextvars.ContextVar("parts_of_today_said", default=None)
+
+
+def _part_of_day(key, runtime, form=None):
+    """The phrase for a part of today, `key`, in `form` (a declined form
+    of it) where given: or the language's "same_time" word when the
+    sentence before named the same part.  The word is said once in a
+    sentence.  A second phrase for the same part in one sentence is the
+    language's "same_part_later", "light snow likely then, turning heavy
+    later", where it has one, and names the part again where it does
+    not."""
+    said = _SAID.get()
+    if said is not None:
+        before, now_said = said
+        if key in now_said and _has("same_part_later", runtime):
+            # Named already in this sentence: later in the same part
+            return _s("same_part_later", runtime)
+        now_said.add(key)
+        if (key in before and _SAME_SAID not in now_said
+                and _has("same_time", runtime)):
+            now_said.add(_SAME_SAID)
+            return _s("same_time", runtime)
+    return _s(form or key, runtime)
+
+
+# Marks a sentence that has already said its "same_time" word
+_SAME_SAID = object()
+
+
+def _period_phrase(dt, now, runtime, by=False, after=None):
+    """The part of the day an hour falls in: "this afternoon", "tonight",
+    "tomorrow morning".  For things that are not on the hour -- a gusty
+    afternoon, a freezing night.  With `by`, a deadline rather than a
+    time, so the small hours become "tomorrow morning": the snow that
+    stops at three is on the ground by then.  Falls back to the hour
+    where the language has no words for the parts of today."""
+    if not _has("this_afternoon", runtime):
+        return _time_phrase(dt, now, runtime, after=after)
+
+    def phrase(key):
+        # "By" a time takes its own form where the language declines it
+        if by and _has(key + "_by", runtime):
+            return _part_of_day(key, runtime, key + "_by")
+        return _part_of_day(key, runtime)
+
+    if dt.date() == now.date():
+        if dt.hour < 12:
+            return phrase("this_morning")
+        if dt.hour < 17:
+            return phrase("this_afternoon")
+        if dt.hour < 21:
+            return phrase("this_evening")
+        return phrase("tonight")
+    if by and dt.date() == (now + timedelta(days=1)).date():
+        if dt.hour < 12:
+            return phrase("tomorrow_morning")
+        if dt.hour < 17:
+            return phrase("tomorrow_afternoon")
+        return phrase("tomorrow_evening")
+    return _time_phrase(dt, now, runtime, after=after)
+
+
+def _is_night(daily, now):
+    """Whether `now` is after dark: past sunset with the evening under
+    way, or before four in the morning.  Without sun events, the hours
+    from eight to four."""
+    from linecast.weather.hourly import _parse_sun_events
+    for rise, sunset in _parse_sun_events(daily):
+        if rise is not None and rise.date() == now.date():
+            if sunset is None:
+                break
+            return (now > sunset and now.hour >= 12) or (now < rise and now.hour < 4)
+    return now.hour >= 20 or now.hour < 4
+
+
+# ---------------------------------------------------------------------------
+# Feels-like line
+# Open-Meteo's apparent temperature is the Australian one, which is the air
+# temperature plus a humidity term and minus a wind term:
+#
+#     AT = Ta + 0.33e - 0.70v - 4.00      e in hPa, v in m/s
+#
+# with sunshine added on top.  Checked against the API hour by hour, those
+# two terms account for the reading to within a few tenths overnight, and
+# what is left over rises and falls with the sun.  So the same arithmetic,
+# run backwards, says how much of the gap each of the three is holding --
+# no guessing from thresholds, and the answer is right by construction.
+#
+# A term has to be worth a degree Celsius before it is worth a sentence.
+_FEELS_FLOOR_C = 1.0
+# The humidity term is zero at a dew point near 10 C, so cold air always
+# reads as dry to the formula whatever its relative humidity: Longyearbyen
+# at 91% is not "dry air".  The term is only named as dryness when the
+# air is dry in the sense a person means.
+_FEELS_DRY_RH = 40
+
+
+def _feels_terms(temp_c, humidity, wind_ms, gap_c):
+    """What humidity, wind and sunshine each contribute, in degrees Celsius."""
+    vapour = humidity / 100 * 6.105 * math.exp(17.27 * temp_c / (237.7 + temp_c))
+    humid = 0.33 * vapour - 4.0     # zero at a dew point near 10 C
+    wind = -0.70 * wind_ms
+    return {"humid": humid, "wind": wind, "sun": gap_c - humid - wind}
+
+
+def _is_daylight(daily, now):
+    """Whether `now` falls between today's sunrise and sunset.  False when
+    the day has no sunrise -- a polar winter, or a forecast that omits it."""
+    from linecast.weather.hourly import _parse_sun_events
+    for rise, sunset in _parse_sun_events(daily):
+        if rise is not None and rise.date() == now.date():
+            return sunset is not None and rise <= now <= sunset
+    return False
+
+
+def feels_sentence(current, daily, now, runtime=None):
+    """Why the air feels warmer or cooler than the thermometer reads.
+
+    Names whichever of humidity, wind and sunshine is holding most of the
+    gap, and says nothing when the gap is small, when no one thing is
+    holding a degree of it, or when the forecast is too old to carry the
+    humidity the arithmetic needs.  The header already prints the number;
+    this is only here to say what is behind it."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _feels(current, daily, now, runtime)[0]
+
+
+# Below this the air is cold, and a wind makes it feel colder rather
+# than cooler.
+_FEELS_COLD_C = 10
+
+
+def _feels(current, daily, now, runtime):
+    """The feels-like sentence and the cause it names."""
+    if felt_index(current, runtime) is not False:
+        # The header's "humidex" or "wind chill" already names the cause
+        return "", None
+    temp = current.get("temperature_2m")
+    feels = current.get("apparent_temperature")
+    humidity = current.get("relative_humidity_2m")
+    wind = current.get("wind_speed_10m")
+    if temp is None or feels is None or humidity is None or wind is None:
+        return "", None
+
+    # A gap has to be one a person would notice before it is worth a
+    # sentence: six degrees Fahrenheit, or three Celsius.
+    gap = feels - temp
+    if abs(gap) < (3 if runtime.celsius else 6):
+        return "", None
+
+    to_c = (lambda t: t) if runtime.celsius else (lambda t: (t - 32) * 5 / 9)
+    terms = _feels_terms(
+        to_c(temp), humidity,
+        runtime.wind_kmh(wind) / 3.6,
+        gap if runtime.celsius else gap * 5 / 9,
+    )
+
+    if gap < 0 and humidity >= _FEELS_DRY_RH:
+        del terms["humid"]
+
+    # Of the terms pushing the way the reading went, the largest one.
+    pushing = sorted(((abs(size), name) for name, size in terms.items()
+                      if (size > 0) == (gap > 0)), reverse=True)
+    if not pushing or pushing[0][0] < _FEELS_FLOOR_C:
+        return "", None
+
+    holding = pushing[0][1]
+
+    def said(key):
+        # Air that is cold already feels colder, not cooler, where the
+        # language tells the two apart
+        if to_c(temp) < _FEELS_COLD_C and _has(key + "_cold", runtime):
+            key += "_cold"
+        return _s(key, runtime)
+
+    if holding == "wind":
+        return said("feels_wind"), "wind"
+    if holding == "humid":
+        return (_s("feels_humid", runtime) if gap > 0 else said("feels_dry")), "humid"
+    # Sunshine is the leftover, so it carries whatever the formula and the
+    # API disagree about.  Claim it only when it warms, and only with the
+    # sun actually up.
+    if gap > 0 and _is_daylight(daily, now):
+        return _s("feels_sun", runtime), "sun"
+    return "", None
+
+
+# The felt temperature ahead is worth a sentence when it is extreme and
+# not what this place is used to: heat a person should plan around, or a
+# wind chill they should dress for.  What the place is used to is read
+# off the rest of the forecast week; a gap between felt and thermometer
+# that every day has is the climate, not news.  Past the danger marks it
+# is said regardless.
+#
+# And it has to be news against the hour the reader is in.  Promising 34°
+# when the header already says it feels 34° says nothing, and costs the
+# present-tense sentence that would have said why, so the hour ahead has
+# to be a couple of degrees past the one at hand before it is named.
+_FEELS_AHEAD_HOT_C = 33
+_FEELS_AHEAD_COLD_C = -15
+_FEELS_AHEAD_DANGER_HOT_C = 40
+_FEELS_AHEAD_DANGER_COLD_C = -25
+_FEELS_AHEAD_UNUSUAL_C = 2.0
+_FEELS_AHEAD_BEYOND_NOW_C = 2.0
+
+
+def feels_ahead_sentence(hourly, now, runtime=None, daily=None, current=None):
+    """"High humidity will make it feel as high as 36° this afternoon":
+    the felt temperature at the hottest or coldest hour of the day
+    ahead, when it is extreme, the air temperature does not say so on
+    its own, and it is a couple of degrees past what it feels like now,
+    with what is behind it when one thing is.  The current hour is the
+    feels-like sentence's; this looks past it."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _feels_ahead(hourly, now, runtime, current=current)[0]
+
+
+def _felt(humidexes, wind_chills, k, temp):
+    """Hour `k`'s humidex, else its wind chill, else `temp`."""
+    for values in (humidexes, wind_chills):
+        if k < len(values) and values[k] is not None:
+            return values[k]
+    return temp
+
+
+def _feels_ahead(hourly, now, runtime, after=None, current=None):
+    """The feels-ahead sentence, the hour it is about, and its cause."""
+    nothing = ("", None, None)
+    canadian = felt_index(hourly, runtime, 0) is not False
+    if not _has("feels_ahead_hot", runtime) and not canadian:
+        return nothing
+    temps = hourly.get("temperature_2m") or []
+    feels = hourly.get("apparent_temperature") or []
+    if canadian:
+        # Canada's indices stand in for the felt temperature, and an hour
+        # with neither is felt as the thermometer reads.
+        feels = [_felt(hourly["humidex"], hourly["wind_chill"], k, t)
+                 for k, t in enumerate(temps)]
+    humidity = hourly.get("relative_humidity_2m") or []
+    wind = hourly.get("wind_speed_10m") or []
+    later = [(i, dt) for i, dt in _hours_ahead(hourly, now)
+             if (dt - now).total_seconds() >= 1.5 * 3600
+             and i < len(temps) and i < len(feels)
+             and temps[i] is not None and feels[i] is not None]
+    if not later:
+        return nothing
+    to_c = (lambda t: t) if runtime.celsius else (lambda t: (t - 32) * 5 / 9)
+    gap_c = 3.0
+
+    i, dt = max(later, key=lambda h: feels[h[0]])
+    hot = (to_c(feels[i]) >= _FEELS_AHEAD_HOT_C
+           and to_c(feels[i]) - to_c(temps[i]) >= gap_c)
+    if not hot:
+        i, dt = min(later, key=lambda h: feels[h[0]])
+        if not (to_c(feels[i]) <= _FEELS_AHEAD_COLD_C
+                and to_c(temps[i]) - to_c(feels[i]) >= gap_c):
+            return nothing
+    gap = to_c(feels[i]) - to_c(temps[i])
+
+    # Is it anything the reader does not already have?  A sentence about
+    # an extreme is for planning, and there is nothing to plan for in a
+    # temperature it feels like right now.
+    felt_now = (current or {}).get("apparent_temperature")
+    if canadian and current:
+        felt_now = _felt([current.get("humidex")], [current.get("wind_chill")], 0,
+                         current.get("temperature_2m"))
+    if felt_now is not None:
+        beyond = to_c(feels[i]) - to_c(felt_now)
+        if (beyond if hot else -beyond) < _FEELS_AHEAD_BEYOND_NOW_C:
+            return nothing
+
+    # Is this what the place is used to?  The same gap on the other days
+    # of the forecast says yes, unless the reading is dangerous anyway.
+    danger = (to_c(feels[i]) >= _FEELS_AHEAD_DANGER_HOT_C if hot
+              else to_c(feels[i]) <= _FEELS_AHEAD_DANGER_COLD_C)
+    if not danger:
+        pick = max if hot else min
+        by_day = {}
+        for k, t in enumerate(hourly.get("time") or []):
+            if k >= len(temps) or k >= len(feels) or temps[k] is None or feels[k] is None:
+                continue
+            day = t[:10]
+            gap_k = to_c(feels[k]) - to_c(temps[k])
+            by_day[day] = pick(by_day.get(day, gap_k), gap_k)
+        others = [g for day, g in by_day.items() if day != dt.date().isoformat()]
+        if others:
+            others.sort()
+            usual = others[len(others) // 2]
+            if abs(gap - usual) < _FEELS_AHEAD_UNUSUAL_C:
+                return nothing
+
+    if canadian:
+        # "Humidex 38 this afternoon", as Environment Canada words it;
+        # the index names its own cause
+        key = "humidex_ahead" if hot else "wind_chill_ahead"
+        value = f"{round(feels[i])}".replace("-", "−")
+        return (_ucfirst(_s(key, runtime, value=value,
+                            time=_period_phrase(dt, now, runtime, after=after))),
+                dt, "humid" if hot else "wind")
+    cause = None
+    if i < len(humidity) and i < len(wind) and humidity[i] is not None and wind[i] is not None:
+        terms = _feels_terms(to_c(temps[i]), humidity[i],
+                             runtime.wind_kmh(wind[i]) / 3.6, gap)
+        pushing = sorted(((abs(size), name) for name, size in terms.items()
+                          if (size > 0) == (gap > 0)), reverse=True)
+        if pushing and pushing[0][0] >= _FEELS_FLOOR_C:
+            cause = pushing[0][1]
+    key = "feels_ahead_hot" if hot else "feels_ahead_cold"
+    if hot and cause in ("humid", "sun"):
+        key += "_" + cause
+    elif not hot and cause == "wind":
+        key += "_wind"
+    else:
+        cause = None
+    return (_ucfirst(_s(key, runtime, temp=_degrees(feels[i], runtime, signed=True),
+                        time=_period_phrase(dt, now, runtime, after=after))), dt, cause)
+
+
+# ---------------------------------------------------------------------------
+# Comparative weather line
+# ---------------------------------------------------------------------------
+# The hour the comparison stops looking back at yesterday and starts looking
+# ahead to tomorrow.  Most of today's high is in by then.
+_COMPARISON_TURNS_TO_TOMORROW = 14
+
+
+def _daily_highs(daily, now, offsets):
+    """The daily highs `offsets` days from today, None for a day the
+    forecast does not have.
+
+    The dates are resolved in cached forecasts too: index 1 only means
+    today on the day of the fetch.  Undated series use past_days=1, and
+    stop where the series does."""
+    highs = daily.get("temperature_2m_max", [])
+    if daily.get("time") is not None:
+        by_date = dict(zip(daily["time"], highs))
+        return [by_date.get((now.date() + timedelta(days=offset)).isoformat())
+                for offset in offsets]
+    return [highs[offset + 1] for offset in offsets if offset + 1 < len(highs)]
+
+
+def _change_floors(runtime):
+    """The degrees from which one day's high is not about the same as
+    another's, is more than a bit off it, and is much off it: smaller
+    in Celsius, since 1°C ≈ 1.8°F."""
+    return (2, 4, 8) if runtime.celsius else (3, 8, 15)
+
+
+def _comparison(daily, now, runtime, inherited=False):
+    """The comparative sentence and its salience: nothing to say, about the
+    same, a few degrees, or a real change.  With `inherited`, the sentence
+    before this one has already said "tomorrow", and the language's
+    "will_be_then" form carries it: "It will be 3° cooler than today"."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    hi_temps = _daily_highs(daily, now, (-1, 0, 1))
+    if len(hi_temps) < 3:
+        return "", 0
+
+    if now.hour < _COMPARISON_TURNS_TO_TOMORROW:
+        a, b = hi_temps[0], hi_temps[1]
+        ref_key, subject = "yesterday", _s("today_subj", runtime)
+    else:
+        a, b = hi_temps[1], hi_temps[2]
+        ref_key, subject = "today_ref", _s("tomorrow_subj", runtime)
+    ref_day = _s(ref_key, runtime)
+    # The reference day with "and", "with", for a language whose word
+    # for it depends on the day: Korean 어제와, 오늘과
+    ref_day_with = _s(ref_key + "_with", runtime) if _has(ref_key + "_with", runtime) else ref_day
+    # Either day's high can be null; there is then nothing to compare.
+    if a is None or b is None:
+        return "", 0
+    diff = b - a
+
+    abs_diff = abs(diff)
+    t_same, t_bit, t_much = _change_floors(runtime)
+    if abs_diff < t_same:
+        key, salience = "same_temp", 2
+    elif abs_diff < t_bit:
+        key, salience = ("bit_warmer" if diff > 0 else "bit_cooler"), 2
+    elif abs_diff < t_much:
+        key, salience = ("warmer" if diff > 0 else "cooler"), 2
+    else:
+        key, salience = ("much_warmer" if diff > 0 else "much_cooler"), 3
+
+    # Past "a bit", the number stands in for the words where the language
+    # has the form for it; the others keep their words.  A small change
+    # stays "a bit": 3° is a precision the reader has no use for.
+    if (key not in ("same_temp", "bit_warmer", "bit_cooler")
+            and _has("warmer_by", runtime) and _has("degrees", runtime)):
+        key = "warmer_by" if diff > 0 else "cooler_by"
+    form = "will_be"
+    if inherited and _has("will_be_then", runtime):
+        form = "will_be_then"
+        if _has(key + "_then", runtime):
+            # French keeps the subject inside the comparison; the
+            # inherited form has one without it
+            key += "_then"
+    comparison = _s(key, runtime, ref_day=ref_day, ref_day_with=ref_day_with,
+                    subject=subject.lower(), diff=_degrees(diff, runtime))
+    return _s(form, runtime, subject=subject, comparison=comparison), salience
+
+
+def comparative_sentence(daily, now, runtime=None):
+    """Plain-text natural language comparing today vs yesterday/tomorrow."""
+    return _comparison(daily, now, runtime)[0]
+
+
+# ---------------------------------------------------------------------------
+# The highs ahead
+# ---------------------------------------------------------------------------
+# A day's high is a change from another's when it is more than "a bit"
+# off it, the comparison's own measure.  The week is read as far as the
+# daily forecast under the paragraph shows it; past the third day a
+# change has to be a big one, as rain that far off has to be surer.
+_TURN_LAST_DAY = 6
+_TURN_NEAR_DAYS = 3
+# The change back is the same spell of weather for two days after the
+# turn.  Later than that it is another week's news.
+_TURN_BACK_DAYS = 2
+
+
+def high_tomorrow_sentence(daily, hourly, now, runtime=None):
+    """"It will get up to 30° tomorrow afternoon": tomorrow's high and
+    the part of the day it comes in, when it is a change from today's.
+
+    Said in the hours the comparison is still about yesterday.  After
+    that the comparison is about tomorrow and says the same thing.
+
+    A day whose warmest hour is in the small hours is falling from
+    midnight on: its high is the last of today's warmth, not something
+    tomorrow gets up to, and it goes unsaid.  So does a day without its
+    hours, which has no part of the day to name."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _high_tomorrow(daily, hourly, now, runtime)[0]
+
+
+def _high_tomorrow(daily, hourly, now, runtime, after=None):
+    """The sentence for tomorrow's high, its salience, and the hour of
+    the high."""
+    nothing = ("", 0, None)
+    today = _daily_highs(daily, now, (0,))
+    if not today or today[0] is None:
+        return nothing
+    day = (now + timedelta(days=1)).date()
+    temps = hourly.get("temperature_2m") or []
+    hours = [(i, dt) for i, dt in _hours_ahead(hourly, now, span=48)
+             if dt.date() == day and i < len(temps) and temps[i] is not None]
+    if not hours:
+        return nothing
+    i, at = max(hours, key=lambda h: temps[h[0]])
+    if at.hour < 5:
+        return nothing
+    change = temps[i] - today[0]
+    _, t_bit, t_much = _change_floors(runtime)
+    if abs(change) < t_bit:
+        return nothing
+    # A cooler day gets up to its high too, but "only" that far
+    key = "high_up_to" if change > 0 else "high_only_up_to"
+    if not _has(key, runtime):
+        return nothing
+    return (_s(key, runtime, temp=_degrees(temps[i], runtime, signed=True),
+               time=_time_phrase(at, now, runtime, after=after)),
+            3 if abs(change) >= t_much else 2, at)
+
+
+def highs_turn_sentence(daily, now, runtime=None):
+    """"Cooler on Sunday, then warmer again on Monday": the next sharp
+    change in the week's highs after tomorrow, and the change back when
+    one follows it.
+
+    Tomorrow is the comparison's, or the sentence above's.  This reads
+    on from there, for the first day whose high is a change from the
+    day before it.  A week that drifts by a degree a day has no day to
+    name and goes unsaid."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _highs_turn(daily, now, runtime)[0]
+
+
+def _highs_turn(daily, now, runtime):
+    """The sentence for the week's highs, its salience, the day it turns
+    on, and the day it turns back on, when it does."""
+    nothing = ("", 0, None, None)
+    if not _has("highs_cooler", runtime):
+        return nothing
+    # highs[k] is the day k days from today
+    highs = [None] + _daily_highs(daily, now, range(1, _TURN_LAST_DAY + 1))
+    _, t_bit, t_much = _change_floors(runtime)
+
+    def noon(k):
+        return (now + timedelta(days=k)).replace(hour=12, minute=0, second=0, microsecond=0)
+
+    def on(k):
+        return _on_full_day(noon(k).date(), runtime)
+
+    turn = None
+    for k in range(2, len(highs)):
+        if highs[k] is None or highs[k - 1] is None:
+            return nothing
+        if abs(highs[k] - highs[k - 1]) >= (t_bit if k <= _TURN_NEAR_DAYS else t_much):
+            turn = k
+            break
+    if turn is None:
+        return nothing
+    step = highs[turn] - highs[turn - 1]
+    much = abs(step) >= t_much
+    key = ("highs_much_" if much else "highs_") + ("warmer" if step > 0 else "cooler")
+    sentence = _s(key, runtime, day=on(turn))
+    # The change back is measured from the furthest the turn goes: a
+    # cool day, a cooler one, and then a warm one is one turn and back
+    furthest = highs[turn]
+    back = "highs_then_cooler" if step > 0 else "highs_then_warmer"
+    for k in range(turn + 1, min(turn + _TURN_BACK_DAYS, len(highs) - 1) + 1):
+        if highs[k] is None or not _has(back, runtime):
+            break
+        if (highs[k] > furthest) == (step > 0):
+            furthest = highs[k]
+        elif abs(highs[k] - furthest) >= t_bit:
+            return (_s(back, runtime, change=sentence, then=on(k)),
+                    2 if much else 1, noon(turn), noon(k))
+    return sentence, 2 if much else 1, noon(turn), None
+
+
+# ---------------------------------------------------------------------------
+# Precipitation forecast line
+# ---------------------------------------------------------------------------
+def _ucfirst(s):
+    """Uppercase first character without lowering the rest (preserves German noun caps)."""
+    return s[:1].upper() + s[1:] if s else s
+
+
+_PRECIP_DESCS = {
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light showers", 81: "showers", 82: "heavy showers",
+    85: "snow showers", 86: "heavy snow showers",
+    95: "thunderstorms", 96: "thunderstorms", 99: "thunderstorms",
+}
+
+# How hard each precipitation code falls, one step at a time, so a run
+# of rain can say when it turns heavy without calling a let-up a turn.
+# Drizzle sits half a step under the rain of its grade: heavy drizzle
+# turning to rain is the rain coming on, not the same weather renamed.
+_PRECIP_RANK = {
+    51: 0.5, 53: 1.5, 55: 2.5, 56: 1.5, 57: 2.5,
+    61: 2, 63: 3, 65: 4, 66: 3, 67: 4,
+    71: 2, 73: 3, 75: 4, 77: 1,
+    80: 2, 81: 3, 82: 4, 85: 3, 86: 4,
+    95: 4, 96: 5, 99: 5,
+}
+
+# What kind of thing is falling.  A turn from one kind to another is
+# always worth a word -- drizzle to rain, rain to snow, showers to
+# thunder.  Within a kind, only a turn to heavy is: nobody says "light
+# drizzle becoming drizzle" out loud.
+_PRECIP_KIND = {
+    51: "drizzle", 53: "drizzle", 55: "drizzle", 56: "drizzle", 57: "drizzle",
+    61: "rain", 63: "rain", 65: "rain", 66: "rain", 67: "rain",
+    80: "rain", 81: "rain", 82: "rain",
+    71: "snow", 73: "snow", 75: "snow", 77: "snow", 85: "snow", 86: "snow",
+    95: "thunder", 96: "thunder", 99: "thunder",
+}
+_HEAVY_RANK = 4
+_SNOW_CODES = {71, 73, 75, 77, 85, 86}
+_FREEZING_CODES = {56, 57, 66, 67}
+
+
+def _precip_phase(code):
+    """What an hour leaves on the ground: "snow", "ice" or "water", or
+    None for a dry hour.  A change from one to another is a change in
+    what a person has to do about it."""
+    if code not in _PRECIP_CODES:
+        return None
+    if code in _SNOW_CODES:
+        return "snow"
+    return "ice" if code in _FREEZING_CODES else "water"
+
+
+# Open-Meteo's hourly probability, and the hedge it earns: a chance below
+# sixty, likely below eighty, and no hedge at all from eighty up.
+_PRECIP_CHANCE_BELOW = 60
+_PRECIP_LIKELY_BELOW = 80
+
+
+@functools.lru_cache(maxsize=None)
+def _precip_descs(lang):
+    """The precipitation nouns by WMO code in `lang`: English under the
+    language's own, and a regional variant's few under its base's."""
+    descs = dict(_PRECIP_DESCS)
+    for code in reversed(fallbacks(lang)):
+        descs.update(_PRECIP_DESCS_I18N.get(code, {}))
+    return descs
+
+
+@functools.lru_cache(maxsize=None)
+def _precip_partitives(lang):
+    """The precipitation nouns with their article, by WMO code, where the
+    language has them: a regional variant's under its base's."""
+    forms = {}
+    for code in reversed(fallbacks(lang)):
+        forms.update(_PRECIP_PARTITIVES_I18N.get(code, {}))
+    return forms
+
+
+def _peak_hour(run, amounts, codes, desc=None, open_ended=False):
+    """The hour in a run of precipitation worth naming on its own, or None.
+
+    The peak is the hour with the most forecast, the tallest column of
+    the bar under the chart; with no amounts it is the hour of the
+    heaviest code.  It is named only when it is a turn a person would
+    mention: to another kind of precipitation, or to heavy.  A run that
+    keeps its name says nothing more, and neither does one whose turn
+    the language has no separate word for.  The hour returned is the
+    first at which the run reads as the peak does.
+
+    A turn can be hiding behind the peak: the thunder at eight after a
+    wetter hour of plain rain at seven.  When the peak is not a turn,
+    the run's first hour of thunder is named instead -- weather a person
+    would change their plans for, rather than the same water in another
+    size, which the peak already speaks for.
+
+    Ahead of both comes a change in what lands: snow to rain, rain to
+    ice, ice to rain.  That is the news of a run whatever the ranks, but
+    only where it holds.  Near freezing the hours flip between rain and
+    snow, and a flip is not a turn.
+    """
+    def amount(idx):
+        return _at(amounts, idx) or 0
+
+    def rank(idx):
+        return _PRECIP_RANK.get(_at(codes, idx, 0), 0)
+
+    def code(idx):
+        return _at(codes, idx, 0)
+
+    def kind(idx):
+        return _PRECIP_KIND.get(code(idx))
+
+    def phase(idx):
+        return _precip_phase(code(idx))
+
+    first = run[0][0]
+    later = run[1:]
+    if not later:
+        return None
+
+    def changeover(to):
+        """Where the run turns to snow, ice or water: its place in the run
+        and the hour that names it, the wettest of the new weather, or
+        None.  The new weather comes as three wet hours running, or as two
+        the run ends on; a run cut off by the day's window may turn in its
+        last hour.  Two hours of snow and then rain all night are a
+        wobble near freezing, and three hours of ice between the rain are
+        the news."""
+        wet = [(n, j) for n, (j, _) in enumerate(run) if n and phase(j)]
+        for k, (n, _) in enumerate(wet):
+            stretch = []
+            for _, j in wet[k:]:
+                if phase(j) != to:
+                    break
+                stretch.append(j)
+            ends_run = k + len(stretch) == len(wet)
+            if len(stretch) >= 3 or (ends_run and (len(stretch) >= 2 or open_ended)):
+                return n, max(stretch, key=lambda j: (amount(j), rank(j)))
+        return None
+
+    turns = [t for t in (changeover(to) for to in ("snow", "ice", "water")
+                         if to != phase(first)) if t]
+    if turns:
+        # Where the run turns twice, the sooner: snow turning to ice for
+        # the evening and to rain for its last two hours is snow turning
+        # to ice
+        n, i = min(turns)
+        if desc is None or desc(i) != desc(first):
+            return i, run[n][1]
+
+    def worth_naming(idx):
+        """Whether an hour is a turn a person would mention: to another
+        kind of precipitation, or to heavy, and one the language has a
+        separate word for.  A change in what lands is named above where
+        it holds, and nowhere else."""
+        if phase(idx) != phase(first):
+            return False
+        if rank(idx) <= rank(first):
+            return False
+        if kind(idx) == kind(first) and rank(idx) < _HEAVY_RANK:
+            return False
+        return desc is None or desc(idx) != desc(first)
+
+    def another_thing(idx):
+        """Thunder where the run began as something else.  Drizzle after
+        showers is the same water in another size, and a let-up rather
+        than a turn, whatever its rank."""
+        return kind(idx) == "thunder" and kind(first) != "thunder"
+
+    peak = None
+    if any(amount(i) for i, _ in run):
+        i, dt = max(later, key=lambda h: amount(h[0]))
+        if amount(i) > amount(first):
+            peak = (i, dt)
+    else:
+        peak = max(later, key=lambda h: rank(h[0]))
+    if peak is None or not worth_naming(peak[0]):
+        # The wettest hour of the run is no turn, but one can be hiding
+        # behind it: an hour of thunder carries less water than the hour
+        # of rain before it and is still what a person would be told.
+        peak = next(((j, when) for j, when in later
+                     if another_thing(j) and worth_naming(j)), None)
+        if peak is None:
+            return None
+    i, dt = peak
+    # The peak says what it turns into; the turn is when the run first
+    # reaches that.  Drizzle now with rain from two and the most of it
+    # after midnight becomes rain in a couple of hours, not overnight.
+    # A turn to another kind is when that kind begins, though its first
+    # hours are lighter than the peak: drizzle with light rain from
+    # seven and rain from one turns to rain at seven.  The peak still
+    # names it.  A heavy peak is its own news, and turns when it comes.
+    new_kind = kind(i) != kind(first) and rank(i) < _HEAVY_RANK
+    for n, (j, when) in enumerate(run):
+        if new_kind:
+            reached = kind(j) == kind(i) and code(j) in _PRECIP_CODES
+        elif desc is not None:
+            reached = desc(j) == desc(i)
+        else:
+            reached = code(j) == code(i)
+        if reached:
+            # A turn needs two hours of the new weather to be worth its
+            # own clause, unless the run is cut off by the end of the
+            # day's window rather than by dry weather
+            if not open_ended and n > len(run) - 2:
+                return None
+            return (i if new_kind else j), when
+    return i, dt
+
+
+def _precip_parts(hourly, now, runtime, daily=None, after=None, current=None):
+    """The precipitation sentence for the next 24 hours, and what it was
+    built from, for the sentences that follow it: the run of wet hours,
+    when it ends, the next run after that, and the hour window."""
+    parts = {"sentence": "", "kind": "", "run": [], "end": None, "next": None,
+             "window": [], "salience": 0, "desc": None, "codes": [], "last_named": None}
+    lang = runtime.lang
+    precip_prob = hourly.get("precipitation_probability", [])
+    codes = hourly.get("weather_code", [])
+    amounts = hourly.get("precipitation") or []
+    parts["codes"] = codes
+
+    if not hourly.get("time") or not precip_prob or not codes:
+        return parts
+
+    window = _hours_ahead(hourly, now)
+    if len(window) < 2:
+        return parts
+    parts["window"] = window
+
+    def prob(idx):
+        # A null probability or code is an hour that says nothing
+        return _at(precip_prob, idx) or 0
+
+    # The header prints what is falling now, so the prose cannot say it
+    # has not started: when the current conditions are wet, the hour we
+    # are in is wet too, whatever its own odds.  Hong Kong's drizzle at
+    # exactly thirty percent is drizzle.
+    current_wet = (current or {}).get("weather_code") in _PRECIP_CODES
+    first_idx = window[0][0]
+
+    def is_precip(idx):
+        c = _at(codes, idx, 0)
+        if c not in _PRECIP_CODES:
+            return False
+        return prob(idx) > 30 or (idx == first_idx and current_wet)
+
+    def desc(idx):
+        c = _at(codes, idx, 0)
+        descs = _precip_descs(lang)
+        return descs.get(c, _PRECIP_DESCS.get(c, "precipitation"))
+
+    parts["desc"] = desc
+
+    def run_from(n):
+        """The wet hours from window[n] on, and the first dry hour after
+        them.  A single dry hour with rain on both sides is a lull, not an
+        ending, and stays in the run."""
+        run = [window[n]]
+        k = n + 1
+        while k < len(window):
+            i, dt = window[k]
+            if not is_precip(i):
+                if k + 1 < len(window) and is_precip(window[k + 1][0]):
+                    run.append((i, dt))
+                    k += 1
+                    continue
+                return run, k
+            run.append((i, dt))
+            k += 1
+        return run, None
+
+    def salience(run):
+        heavy = any(_PRECIP_RANK.get(codes[i], 0) >= _HEAVY_RANK
+                    or codes[i] in _FREEZING_CODES for i, _ in run if i < len(codes))
+        return 5 if heavy else 4
+
+    def water(idx):
+        """What an hour brings, to weigh it against another: its forecast
+        amount, and the rank of its code between two the same."""
+        amount = _at(amounts, idx) or 0
+        return amount, _PRECIP_RANK.get(_at(codes, idx, 0), 0)
+
+    def sentence(key, run, end=None, start=None, open_ended=False, **words):
+        """The template for `key`, or its "becoming" form when the run
+        has an hour heavier than its first worth naming.  The hours are
+        phrased in the order the sentence says them, so "tomorrow" is
+        said once: the start, then the turn; or the turn, then the end.
+        The last hour named is left in parts["last_named"] for the
+        sentence that follows."""
+        peak = _peak_hour(run, amounts, codes, desc, open_ended)
+        # The hour whose noun the sentence opens with, for agreement.
+        # What is falling now is named, however soon it turns: "heavy
+        # drizzle now, becoming rain soon".
+        noun = run[0][0]
+        # An hour of drizzle at the edge of a storm is the storm:
+        # "thunderstorms starting around noon", not "drizzle at eleven
+        # becoming thunderstorms at noon".  Across a change in what lands
+        # the edge is an hour at most -- two hours of snow ahead of the
+        # rain are snow on the road -- and the storm is whichever carries
+        # more of the water: an hour of wet snow ahead of drizzle is snow.
+        changes = peak and _precip_phase(codes[peak[0]]) != _precip_phase(codes[noun])
+        edge = 3600 if changes else 2 * 3600
+        if peak and start is not None and (peak[1] - start).total_seconds() <= edge:
+            if not (changes and water(noun) >= water(peak[0])):
+                words["desc"] = desc(peak[0])
+                noun = peak[0]
+                start = peak[1]
+            peak = None
+        if start is not None:
+            words["time"] = _time_phrase(start, now, runtime, after=after)
+        if peak:
+            # Rain that turns heavy is the same rain, harder: a language
+            # that says so in its own way ("雨が強まり", not "雨が強い雨と
+            # なり") carries a "_heavier" form of the template, and the
+            # "_becoming" form is kept for a turn to another kind
+            # Rain that freezes is not the rain turned heavy, whatever
+            # its rank: it is another thing, and says so
+            same_kind = (_PRECIP_KIND.get(codes[peak[0]])
+                         == _PRECIP_KIND.get(codes[run[0][0]])
+                         and (codes[peak[0]] in _FREEZING_CODES)
+                         == (codes[run[0][0]] in _FREEZING_CODES))
+            if same_kind and _has(key + "_heavier", runtime):
+                key += "_heavier"
+            else:
+                key += "_becoming"
+            peak_code = codes[peak[0]] if peak[0] < len(codes) else 0
+            words.update(peak=desc(peak[0]),
+                         peak_art=_precip_partitives(lang).get(peak_code, desc(peak[0])),
+                         peak_time=_time_phrase(peak[1], now, runtime, after=start,
+                                                same_sentence=True))
+        if end is not None:
+            words["time"] = _time_phrase(end, now, runtime, after=peak[1] if peak else None,
+                                         same_sentence=True)
+        parts["last_named"] = end or (peak[1] if peak else None) or start
+        return _ucfirst(_precip_s(key, _at(codes, noun, 0), runtime,
+                                  **words))
+
+    if is_precip(first_idx):
+        run, end_n = run_from(0)
+        parts["run"] = run
+        parts["salience"] = salience(run)
+        if end_n is not None:
+            end = window[end_n][1]
+            parts["kind"] = "ending"
+            parts["end"] = end
+            for i, dt in window[end_n + 1:]:
+                if is_precip(i):
+                    parts["next"] = (i, dt)
+                    break
+            parts["sentence"] = sentence("ending", run, end=end, desc=desc(first_idx))
+        else:
+            parts["kind"] = "continuing"
+            key = "continuing"
+            if _is_night(daily or {}, now) and _has("continuing_night", runtime):
+                key = "continuing_night"
+            parts["sentence"] = sentence(key, run, desc=desc(first_idx), open_ended=True)
+        return parts
+
+    # Only rain worth planning for leads.  A single forty-percent hour
+    # before lunch is not what a person wants to hear about a day with
+    # an evening thunderstorm in it, so a run that is no more than a
+    # chance leads only when nothing surer follows it inside the day.
+    # The chance then goes unsaid: the paragraph has better to say.
+    leading = None
+    n = 1
+    while n < len(window):
+        i, dt = window[n]
+        if not is_precip(i):
+            n += 1
+            continue
+        run, end_n = run_from(n)
+        best = max(prob(j) for j, _ in run)
+        if leading is None or best >= _PRECIP_CHANCE_BELOW:
+            leading = (i, dt, run, end_n, best)
+        if best >= _PRECIP_CHANCE_BELOW:
+            break
+        n = len(window) if end_n is None else end_n
+    if leading is None:
+        return parts
+
+    i, dt, run, end_n, best = leading
+    parts["run"] = run
+    parts["kind"] = "starting"
+    parts["salience"] = salience(run)
+    # The hedge follows the best hour of the run: how likely it is to
+    # rain at all, not how sure the first drop's hour is.
+    key = "starting"
+    if best < _PRECIP_CHANCE_BELOW and _has("starting_chance", runtime):
+        key = "starting_chance"
+    elif best >= _PRECIP_LIKELY_BELOW and _has("starting_sure", runtime):
+        key = "starting_sure"
+    elif not _names_an_hour(dt, now) and _has("starting_span", runtime):
+        # Likely in a part of the day needs no "starting": "light
+        # drizzle likely in the evening".  Before an hour it does, or
+        # the rain would seem to fall in that hour alone
+        key = "starting_span"
+    parts["sentence"] = sentence(key, run, start=dt, desc=desc(i),
+                                 open_ended=end_n is None)
+    return parts
+
+
+def precipitation_sentence(hourly, now, runtime=None, daily=None, current=None):
+    """Plain-text description of upcoming precipitation."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _precip_parts(hourly, now, runtime, daily, current=current)["sentence"]
+
+
+def _precipitation_line(hourly, now, runtime=None):
+    """ANSI-colored precipitation sentence for the dashboard."""
+    return _prose(precipitation_sentence(hourly, now, runtime))
+
+
+def more_later_sentence(parts, now, runtime, after=None):
+    """"More rain this evening": a second run of precipitation after the
+    first one ends, when there is one within the day and a real break
+    before it."""
+    if parts["kind"] != "ending" or not parts["next"] or not _has("more_later", runtime):
+        return ""
+    i, dt = parts["next"]
+    if (dt - parts["end"]).total_seconds() < 3 * 3600:
+        return ""
+    codes = parts["codes"]
+    return _ucfirst(_precip_s("more_later", _at(codes, i, 0), runtime,
+                              desc=parts["desc"](i),
+                              time=_time_phrase(dt, now, runtime, after=after)))
+
+
+def snow_total_sentence(hourly, now, runtime=None, daily=None, current=None):
+    """Plain-text snow accumulation over the coming run of snow."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    parts = _precip_parts(hourly, now, runtime, daily, current=current)
+    return _snow_sentence(parts, hourly, now, runtime)[0]
+
+
+def _snow_cm(total, runtime):
+    """A snowfall total in centimetres.  Open-Meteo converts snowfall with
+    the rain: in cm, or in inches when the request asks for inches."""
+    return total if runtime.metric else total * 2.54
+
+
+def _snow_sentence(parts, hourly, now, runtime):
+    run = parts["run"]
+    if not run or not _has("snow_total", runtime):
+        return "", False
+    codes = hourly.get("weather_code", [])
+    snowfall = hourly.get("snowfall") or []
+    snowy = [k for k, (i, _) in enumerate(run) if i < len(codes) and codes[i] in _SNOW_CODES]
+    # Most of the snow's own span must be snow: a flake or two in a day
+    # of rain is not a snowfall, but snow that turns to rain is one
+    # however long the rain goes on after it
+    if not snowy or len(snowy) * 2 < snowy[-1] - snowy[0] + 1:
+        return "", False
+    total_cm = _snow_cm(sum(_at(snowfall, i) or 0 for i, _ in run),
+                        runtime)
+    if total_cm < 1:
+        return "", False
+    if runtime.metric:
+        # "About" and a decimal do not go together; whole centimetres
+        amt = f"{total_cm:.0f}{_prose_sep(runtime)}{_s('unit_cm', runtime)}"
+    else:
+        inches = total_cm / 2.54
+        n = f"{inches:.0f}" if inches >= 2 else fmt_decimal(inches, 1, runtime)
+        amt = _prose_inches(n, runtime)
+    # Snow that turns to rain is done piling up when it turns: "about 3
+    # inches of snow by early afternoon", not by the evening the rain
+    # ends in
+    last = snowy[-1]
+    end = run[last + 1][1] if last + 1 < len(run) else parts["end"] or run[-1][1]
+    return (_ucfirst(_s("snow_total", runtime, amt=amt,
+                        time=_period_phrase(end, now, runtime, by=True))),
+            total_cm >= 10)
+
+
+def past_precip_sentence(hourly, now, runtime, station=None):
+    """Plain-text summary of precipitation in the last 24 hours: the
+    model's hours, or what a nearby station's gauge caught where it has
+    one (`station`, from observed.py).
+
+    Snow stays the model's.  A gauge gives snow as the water it melts
+    to, and a heated gauge in the wind catches little of it, so the
+    model's snowfall says more about what is on the ground."""
+    times = hourly.get("time", [])
+    precip = hourly.get("precipitation", [])
+    snowfall = hourly.get("snowfall", [])
+    codes = hourly.get("weather_code", [])
+
+    if not times or not precip:
+        return ""
+
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    past_start = current_hour - timedelta(hours=24)
+
+    total_precip = 0.0
+    total_snow = 0.0
+    snow_hours = 0
+    rain_hours = 0
+    mix_hours = 0
+
+    dropped = 0
+    bad = None
+    for i, t in enumerate(times):
+        try:
+            dt = datetime.fromisoformat(t)
+        except (TypeError, ValueError) as exc:
+            dropped += 1
+            bad = exc
+            continue
+        # Each hour's figure is what fell in the hour before its stamp,
+        # so the last day is the 24 stamps after the start, up to this hour
+        if dt <= past_start or dt > current_hour:
+            continue
+        # A null hour holds no measurable precipitation
+        p = _at(precip, i) or 0
+        s = _at(snowfall, i) or 0
+        c = _at(codes, i, 0)
+        if p > 0 or s > 0:
+            total_precip += p
+            total_snow += s
+            if c in (71, 73, 75, 77, 85, 86):
+                snow_hours += 1
+            elif c in (56, 57, 66, 67):
+                mix_hours += 1
+            else:
+                rain_hours += 1
+    log_skipped("weather/open-meteo", "hourly times", dropped, len(times), bad)
+    if station and not (station["snow_hours"]
+                        and station["snow_hours"] >= max(station["rain_hours"],
+                                                         station["mix_hours"])):
+        total_precip = station["precip"] * (25.4 if runtime.metric else 1)
+        total_snow = 0.0
+        snow_hours = station["snow_hours"]
+        rain_hours = station["rain_hours"]
+        mix_hours = station["mix_hours"]
+    total_snow_cm = _snow_cm(total_snow, runtime)
+
+    # A tenth of an inch, 2.5 mm, before it is worth a sentence: less
+    # than that is a damp pavement, and nobody reports it.  Snow from a
+    # centimetre.
+    worth_water = total_precip >= (2.5 if runtime.metric else 0.1)
+    worth_snow = total_snow_cm >= 1
+    if not worth_water and not worth_snow:
+        return ""
+
+    # The kind that fell most hours, among those that came to enough to
+    # say: a dusting before a wet evening is the rain's sentence
+    metric_sep = _prose_sep(runtime)
+    if worth_snow and (not worth_water or (snow_hours >= rain_hours
+                                           and snow_hours >= mix_hours)):
+        # Show snow accumulation
+        if runtime.metric:
+            amt = f"{fmt_decimal(total_snow_cm, 1, runtime)}{metric_sep}{_s('unit_cm', runtime)}"
+        else:
+            # Snow to the tenth, as the daily forecast and the snowfall
+            # ahead give it; the hundredths are for the water in a gauge
+            inches = total_snow_cm / 2.54
+            amt = _prose_inches(fmt_decimal(inches, 1, runtime), runtime)
+        ptype = _s("snow", runtime)
+    elif mix_hours >= rain_hours:
+        if runtime.metric:
+            amt = f"{fmt_decimal(total_precip, 1, runtime)}{metric_sep}{_s('unit_mm', runtime)}"
+        else:
+            amt = _prose_inches(fmt_decimal(total_precip, 2, runtime), runtime)
+        ptype = _s("mixed_precip", runtime)
+    else:
+        if runtime.metric:
+            amt = f"{fmt_decimal(total_precip, 1, runtime)}{metric_sep}{_s('unit_mm', runtime)}"
+        else:
+            amt = _prose_inches(fmt_decimal(total_precip, 2, runtime), runtime)
+        ptype = _s("rain", runtime)
+
+    return _s("past_precip", runtime, amt=amt, ptype=ptype)
+
+
+def _past_precip_line(hourly, now, runtime):
+    """ANSI-colored past-precipitation sentence for the dashboard."""
+    return _prose(past_precip_sentence(hourly, now, runtime))
+
+
+# ---------------------------------------------------------------------------
+# The week ahead: when it next rains
+# ---------------------------------------------------------------------------
+def next_rain_sentence(daily, now, runtime=None, hourly=None):
+    """The next rain in the week, when nothing falls in the next day and
+    the rain is worth mentioning: "Rain likely on Friday", "Rain likely
+    on Thursday and Friday".  A chance of drizzle in six days is not; the
+    further off, the surer or the wetter it has to be.  Dry spells go
+    unremarked."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _next_rain(daily, now, runtime, hourly)[0]
+
+
+# What a day has to hold to be the next rain worth a sentence, by how
+# far off it is: (days from now, ((least chance, least amount in mm), ...)).
+# A day meeting any pair is worth it, so the wetter the day the less sure
+# it has to be: an inch of rain at a coin-toss is worth a word where a
+# shower is not.
+_NEXT_RAIN_WORTH = (
+    (2, ((60, 2.0), (50, 25.0))),
+    (7, ((70, 5.0), (60, 10.0), (50, 25.0))),
+)
+
+# A day holding this much is heavy whatever its wettest hour is called:
+# an inch of steady rain is a heavy day of rain.
+_HEAVY_DAY_MM = 25.0
+_HEAVIER = {61: 65, 63: 65, 80: 82, 81: 82, 71: 75, 73: 75, 85: 86}
+
+# A run of wet days is named by what falls, not how hard, since the days
+# differ; its wettest day is named apart.
+_KIND_NOUN = {
+    51: 53, 53: 53, 55: 53, 56: 56, 57: 56,
+    61: 63, 63: 63, 65: 63, 66: 66, 67: 66,
+    80: 81, 81: 81, 82: 81,
+    71: 73, 73: 73, 75: 73, 77: 77, 85: 85, 86: 85,
+    95: 95, 96: 95, 99: 95,
+}
+# Kinds that are shades of another in the same run, in the order they
+# fold: drizzle days in a run of rain or showers, shower days in a run of
+# rain, snow showers and grains in a run of snow.
+_KIND_FOLDS = ((53, (63, 81)), (81, (63,)), (85, (73,)), (77, (73,)))
+
+# The wettest day of a run is named when it holds half again what any
+# other day does and is heavy by its hours or its total.
+_HEAVIEST_BY = 1.5
+
+
+def _worth_floor(offset, p, amount):
+    """The least chance the day was worth a sentence at, or None."""
+    pairs = next(w[1] for w in _NEXT_RAIN_WORTH if offset <= w[0])
+    met = [chance for chance, least in pairs if p >= chance and amount >= least]
+    return min(met) if met else None
+
+
+def _next_rain(daily, now, runtime, hourly=None, after=None):
+    """The next-rain sentence and the day it is about: the first day
+    worth a sentence, and the days after it that are too, as one run.
+    "Heavy rain likely on Saturday", "Rain likely on Thursday and
+    Friday", "Rain likely from Saturday to Monday, heaviest on
+    Saturday"."""
+    if not _has("rain_next", runtime):
+        return "", None
+    times = daily.get("time") or []
+    sums = daily.get("precipitation_sum") or []
+    probs = daily.get("precipitation_probability_max") or []
+    codes = daily.get("weather_code") or []
+    if not times or not sums:
+        return "", None
+    mm = 1.0 if runtime.metric else 25.4
+    by_date = {}
+    for k, t in enumerate(times):
+        amount = (_at(sums, k) or 0) * mm
+        p = _at(probs, k) or 0
+        by_date[t] = (amount, p, _at(codes, k, 0))
+    run = []    # (day, first wet hour, code, odds, amount, heavy hours)
+    for offset in range(1, 8):
+        day = now.date() + timedelta(days=offset)
+        row = by_date.get(day.isoformat())
+        if row is None:
+            break
+        amount, p, code = row
+        floor = _worth_floor(offset, p, amount)
+        wet = None
+        if floor is not None:
+            wet = _wet_day(hourly or {}, day, floor, far=offset > 2)
+            if wet is None:
+                # Without the hours, the day's own code says what falls.
+                # A wet tomorrow has no time of day to give it then, so
+                # it goes unsaid.
+                if offset == 1:
+                    return "", None
+                noon = datetime.combine(day, now.time().replace(
+                    hour=12, minute=0, second=0, microsecond=0))
+                wet = (noon, code if code in _PRECIP_CODES else 63, p)
+        if wet:
+            first, code, best = wet
+            heavy = _PRECIP_RANK.get(code, 0) >= _HEAVY_RANK
+            if amount >= _HEAVY_DAY_MM:
+                code = _HEAVIER.get(code, code)
+            run.append((day, first, code, best, amount, heavy or amount >= _HEAVY_DAY_MM))
+        elif run:
+            break
+    if not run:
+        return "", None
+    at = datetime.combine(run[0][0], now.time().replace(hour=12, minute=0, second=0,
+                                                         microsecond=0))
+    if len(run) == 1:
+        _, first, code, best, _, _ = run[0]
+        # A day is drizzly, not heavily drizzly: the grades of drizzle
+        # are an hour's, and "heavy drizzle on Friday" reads as a wet day
+        if code in (51, 55):
+            code = 53
+        if first.date() == (now + timedelta(days=1)).date():
+            when = _time_phrase(first, now, runtime, after=after)
+        else:
+            when = _on_full_day(first, runtime)
+        desc = _run_desc(code, 1, runtime)
+        key = ("rain_next_chance" if best < _PRECIP_CHANCE_BELOW
+               else "rain_next_likely" if best < _PRECIP_LIKELY_BELOW else "rain_next")
+        return _ucfirst(_precip_s(key, code, runtime, desc=desc, time=when)), at
+    return _ucfirst(_run_sentence(run, now, runtime)), at
+
+
+def _run_kinds(run):
+    """The kind each day of a run is named by: a shade of another kind in
+    the run folds into it, so rain and showers over the same days are
+    rain, and drizzle among them is too."""
+    kinds = [_KIND_NOUN.get(r[2], r[2]) for r in run]
+    for kind, into in _KIND_FOLDS:
+        present = [k for k in into if k in kinds]
+        if kind in kinds and present:
+            kinds = [present[0] if k == kind else k for k in kinds]
+    return kinds
+
+
+def _run_sentence(run, now, runtime):
+    """"Rain likely from Friday to Sunday, heaviest on Sunday with
+    thunderstorms", "Rain on Friday, then snow on Saturday and Sunday":
+    a run of wet days named by what falls, hedged by the least certain
+    day, turning where what falls turns, with its wettest day named
+    after.  Thunder comes with the rain around it, so it is said of its
+    own days, and names the run only when every day has it."""
+    kinds = _run_kinds(run)
+    days = [r[0] for r in run]
+    thunder = []
+    if any(k != 95 for k in kinds):
+        thunder = [d for d, k in zip(days, kinds) if k == 95]
+        # A day of thunder falls in with the rain before it, or after it
+        # when it leads
+        for i in range(len(kinds)):
+            if kinds[i] == 95:
+                kinds[i] = next((k for k in kinds[i::-1] if k != 95), None) \
+                    or next(k for k in kinds[i:] if k != 95)
+    blocks = []
+    for day, kind in zip(days, kinds):
+        if blocks and blocks[-1][0] == kind:
+            blocks[-1][1].append(day)
+        else:
+            blocks.append((kind, [day]))
+
+    code, first = blocks[0]
+    best = min(r[3] for r in run)
+    desc = _run_desc(code, len(first), runtime)
+    key = ("rain_next_chance" if best < _PRECIP_CHANCE_BELOW
+           else "rain_next_likely" if best < _PRECIP_LIKELY_BELOW else "rain_next")
+    sentence = _precip_s(key, code, runtime, desc=desc, time=_days_phrase(first, now, runtime))
+    for kind, block in blocks[1:]:
+        sentence = _precip_s("rain_run_then", code, runtime, desc=desc, sentence=sentence,
+                             day=_days_phrase(block, now, runtime),
+                             **_with(kind, len(block), runtime))
+
+    wettest = max(run, key=lambda r: r[4])
+    heaviest = wettest[5] and all(
+        wettest[4] >= _HEAVIEST_BY * r[4] for r in run if r is not wettest)
+    if heaviest and thunder == [wettest[0]]:
+        # The wettest day is the day of thunder: said together
+        return _precip_s("rain_run_heaviest_with", code, runtime, desc=desc,
+                         sentence=sentence, day=_on_day(wettest[0], now, runtime),
+                         **_with(95, 2, runtime))
+    if heaviest:
+        sentence = _precip_s("rain_run_heaviest", code, runtime, desc=desc, sentence=sentence,
+                             day=_on_day(wettest[0], now, runtime))
+    if thunder:
+        sentence = _precip_s("rain_run_with", code, runtime, desc=desc, sentence=sentence,
+                             day=_days_phrase(thunder, now, runtime), **_with(95, 2, runtime))
+    return sentence
+
+
+def _days_phrase(days, now, runtime):
+    """One day as "on Friday" or "tomorrow", several as a span."""
+    if len(days) == 1:
+        return _on_day(days[0], now, runtime)
+    return _day_span(days, now, runtime)
+
+
+def _run_desc(code, days, runtime):
+    """The noun for `code` in the week sentence, counted where the
+    language counts it over several days."""
+    lang = runtime.lang
+    if days > 1:
+        for tag in fallbacks(lang):
+            plural = PRECIP_RUN_DESCS_I18N.get(tag, {}).get(code)
+            if plural:
+                return plural
+    return _precip_descs(lang).get(code, _PRECIP_DESCS.get(code, "rain"))
+
+
+def _with(code, days, runtime):
+    """The nouns a clause after the run names, "with thunderstorms",
+    "then snow": bare as {with}, and as {with_art} in the form its
+    language takes there."""
+    desc = _run_desc(code, days, runtime)
+    return {"with": desc, "with_art": _precip_partitives(runtime.lang).get(code, desc)}
+
+
+def _on_day(day, now, runtime):
+    """"on Friday", or "tomorrow" when it is."""
+    if day == (now + timedelta(days=1)).date():
+        return _s("on_tomorrow", runtime)
+    return _on_full_day(day, runtime)
+
+
+def _on_full_day(day, runtime):
+    """"on Friday", with the day's full name, declined where the language
+    declines it."""
+    lang = runtime.lang
+    name = table_for(FULL_DAY_NAMES, lang)[day.weekday()]
+    forms = ON_FULL_DAY_FORMS.get(lang, ON_FULL_DAY_FORMS.get(base_language(lang), {}))
+    form = forms.get(day.weekday())
+    if form:
+        return form.format(day=name)
+    return _s("on_full_day", runtime, day=name)
+
+
+def _day_span(days, now, runtime):
+    """A run of days by name: "on Thursday and Friday" for two, "from
+    Saturday to Monday" for more, and "tomorrow and Friday", "from
+    tomorrow to Saturday" when it starts tomorrow.  Each day takes the
+    form its place in the phrase asks of it where the language declines
+    the days."""
+    lang = runtime.lang
+    names = table_for(FULL_DAY_NAMES, lang)
+    forms = {}
+    for code in reversed(fallbacks(lang)):
+        for role, table in DAY_SPAN_FORMS.get(code, {}).items():
+            forms.setdefault(role, {}).update(table)
+
+    def form(day, role):
+        return forms.get(role, {}).get(day.weekday(), names[day.weekday()])
+
+    if days[0] == (now + timedelta(days=1)).date():
+        # After "tomorrow" the day stands as it would first in a pair
+        if len(days) == 2:
+            return _s("tomorrow_and_day", runtime, second=form(days[1], "and_first"))
+        return _s("from_tomorrow_to_day", runtime, last=form(days[-1], "to"))
+    if len(days) == 2:
+        return _s("on_two_days", runtime, first=form(days[0], "and_first"),
+                  second=form(days[1], "and_second"))
+    return _s("from_day_to_day", runtime, first=form(days[0], "from"),
+              last=form(days[-1], "to"))
+
+
+def _wet_day(hourly, day, floor, far=False):
+    """What falls on `day` by its hours: (its first wet hour, the code
+    of the hour carrying most of it or of its thunder, the wettest
+    hour's odds).  None
+    when the hours do not reach the day; False when they find nothing
+    worth saying -- nothing at `floor` odds, or only drizzle on a day
+    that is far off."""
+    times = hourly.get("time") or []
+    codes = hourly.get("weather_code") or []
+    probs = hourly.get("precipitation_probability") or []
+    amounts = hourly.get("precipitation") or []
+    wet = []
+    seen = False
+    for i, t in enumerate(times):
+        if i >= len(codes) or i >= len(probs):
+            break
+        try:
+            dt = datetime.fromisoformat(t)
+        except (TypeError, ValueError):
+            continue
+        if dt.date() != day:
+            continue
+        seen = True
+        p = probs[i] or 0
+        if codes[i] in _PRECIP_CODES and p > 30:
+            wet.append((i, dt, p, _at(amounts, i) or 0))
+    if not seen:
+        return None
+    if not wet:
+        return False
+    _, dt, _, _ = wet[0]
+    best = max(w[2] for w in wet)
+    if best < floor:
+        return False
+    # A wet day that opens with a drizzly hour is not a day of drizzle.
+    # The hour carrying most of the water says what falls, and the first
+    # wet hour still says when; with no amounts to weigh, the heaviest
+    # code stands in.
+    if any(w[3] for w in wet):
+        i = max(wet, key=lambda w: w[3])[0]
+    else:
+        i = max(wet, key=lambda w: _PRECIP_RANK.get(codes[w[0]], 0))[0]
+    # Thunder at the day's odds names the day, though a shower hour holds
+    # more of the water: it is the thing to plan for.
+    thunder = [w for w in wet if _PRECIP_KIND.get(codes[w[0]]) == "thunder" and w[2] >= floor]
+    if thunder:
+        i = max(thunder, key=lambda w: _PRECIP_RANK.get(codes[w[0]], 0))[0]
+    if far and _PRECIP_KIND.get(codes[i]) == "drizzle":
+        return False
+    return dt, codes[i], best
+
+
+# ---------------------------------------------------------------------------
+# The sky: clearing and clouding over
+# ---------------------------------------------------------------------------
+# Cloud cover, averaged over three hours, above which the sky is cloudy and
+# below which it is clear.  Between the two nothing is claimed.
+_SKY_CLOUDY = 65
+_SKY_CLEAR = 35
+
+
+def sky_sentence(hourly, now, runtime=None, precip_kind="", precip_end=None):
+    """"Clearing around 2pm", "Clouding over tomorrow morning": the first
+    lasting change in the sky over the next day, when the sky is plainly
+    one thing now and plainly the other later.
+
+    Lasting means the old sky does not come back within the day: a clear
+    hour or two before the marine layer rolls in again is not clearing.
+    The hour named is the hour the change arrives, after dark as much as
+    in the daylight: someone reading at seven in the evening, hoping to
+    see stars, is owed the hour the cloud comes in and not the first
+    hour of the morning that shows it.  Because the old sky has to stay
+    away for the rest of the window, a change in the night is one that
+    still holds when the sun comes up.  Rain that is starting or
+    continuing already says the sky is clouding over, so nothing is said
+    then; after rain that is ending, only a clearing after the end."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _sky(hourly, now, runtime, precip_kind, precip_end)[0]
+
+
+def _sky(hourly, now, runtime, precip_kind="", precip_end=None, after=None):
+    """The sky sentence and the hour it is about."""
+    if not _has("sky_clearing", runtime) or precip_kind in ("starting", "continuing"):
+        return "", None
+    cover = hourly.get("cloud_cover") or []
+    hours = [(i, dt) for i, dt in _hours_ahead(hourly, now)
+             if i < len(cover) and cover[i] is not None]
+    if len(hours) < 4:
+        return "", None
+    values = [cover[i] for i, _ in hours]
+
+    def sky(percent):
+        return ("cloudy" if percent >= _SKY_CLOUDY
+                else "clear" if percent <= _SKY_CLEAR else None)
+
+    def state(k):
+        span = values[k:k + 3]
+        return sky(sum(span) / len(span))
+
+    start = state(0)
+    if start is None:
+        return "", None
+    for k in range(1, len(hours) - 2):
+        new = state(k)
+        if new is None or new == start:
+            continue
+        # A change that holds: the old sky does not return in the hours
+        # left in the day
+        if any(state(m) == start for m in range(k, len(hours))):
+            return "", None
+        # The three-hour mean turns as soon as the change is within
+        # sight of it, up to two hours before the sky itself does; the
+        # hour to name is the first one whose own cover is the new sky.
+        dt = next(hours[m][1] for m in range(k, min(k + 3, len(values)))
+                  if sky(values[m]) == new)
+        if new == "clear":
+            if precip_end is not None and dt < precip_end:
+                return "", None
+            return _ucfirst(_s("sky_clearing", runtime,
+                               time=_time_phrase(dt, now, runtime, after=after))), dt
+        if precip_kind == "ending":
+            return "", None
+        return _ucfirst(_s("sky_clouding", runtime,
+                           time=_time_phrase(dt, now, runtime, after=after))), dt
+    return "", None
+
+
+# ---------------------------------------------------------------------------
+# Fog
+# ---------------------------------------------------------------------------
+# The two codes the model has for fog: fog, and the freezing fog that
+# leaves rime on whatever it touches.  A person says "fog" for both and
+# the prose does too; which of the two it is, the header's label says.
+_FOG_CODES = (45, 48)
+
+
+def fog_sentence(hourly, current, now, runtime=None, daily=None):
+    """"Fog overnight, clearing tomorrow morning": when there is fog in
+    the day ahead, when it closes in, and when it lifts.
+
+    Fog is worth a sentence whatever else the weather is doing, so it is
+    said alongside the rain rather than instead of it.  Fog already out
+    there is said as what it does next, since the header has shown it and
+    the paragraph must not read as though the air were clear.  An hour of
+    it later on is a patch the model happens to have put on the hour and
+    goes unsaid; a clear hour with fog on both sides is a thinning, not a
+    lifting, as with rain."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _fog(hourly, current, now, runtime, daily=daily)[0]
+
+
+def _fog(hourly, current, now, runtime, after=None, daily=None):
+    """The fog sentence, the hour it is anchored at, and the hour it names
+    as the end, when it names one."""
+    nothing = ("", None, None)
+    codes = hourly.get("weather_code") or []
+    window = [(i, dt) for i, dt in _hours_ahead(hourly, now) if i < len(codes)]
+    if len(window) < 2:
+        return nothing
+
+    def is_fog(n):
+        return codes[window[n][0]] in _FOG_CODES
+
+    def part_of_day(dt):
+        """The stretch of the day an hour belongs to, by the parts the
+        prose names: the night runs past midnight, so two in the morning
+        and the evening before it are the one stretch."""
+        if dt.hour >= 21:
+            return dt.date(), "night"
+        if dt.hour < 5:
+            return dt.date() - timedelta(days=1), "night"
+        if dt.hour < 12:
+            return dt.date(), "morning"
+        if dt.hour < 17:
+            return dt.date(), "afternoon"
+        return dt.date(), "evening"
+
+    def run_from(n):
+        """The foggy hours from window[n] on, and the first clear hour
+        after them, or None when the fog outlasts the window."""
+        run = [window[n]]
+        k = n + 1
+        while k < len(window):
+            if not is_fog(k):
+                if k + 1 < len(window) and is_fog(k + 1):
+                    run.append(window[k])
+                    k += 1
+                    continue
+                return run, k
+            run.append(window[k])
+            k += 1
+        return run, None
+
+    if is_fog(0) or (current or {}).get("weather_code") in _FOG_CODES:
+        # Fog the header is already showing.  The reading on the screen
+        # wins over the model's first hour where the two disagree, and
+        # that hour is read as a thinning inside the fog.
+        _, end_n = run_from(0)
+        if end_n is not None:
+            if not _has("fog_ending", runtime):
+                return nothing
+            end = window[end_n][1]
+            return (_ucfirst(_s("fog_ending", runtime,
+                                time=_time_phrase(end, now, runtime, after=after))),
+                    now, end)
+        # Fog with no end in the day ahead: how long it holds is all
+        # there is to say, and that is the day or the night, not an hour.
+        key = "fog_continuing"
+        if _is_night(daily or {}, now) and _has("fog_continuing_night", runtime):
+            key = "fog_continuing_night"
+        if not _has(key, runtime):
+            return nothing
+        return _ucfirst(_s(key, runtime)), now, None
+
+    n = 1
+    while n < len(window):
+        if not is_fog(n):
+            n += 1
+            continue
+        run, end_n = run_from(n)
+        if sum(1 for i, _ in run if codes[i] in _FOG_CODES) > 1:
+            # Fog fills a part of the day rather than arriving at an
+            # hour, so it is named the way the gusty afternoon and the
+            # freezing night are: "fog tonight", not "fog at eleven".
+            # The lifting is an hour, and is named as one.
+            start = run[0][1]
+            time = _period_phrase(start, now, runtime, after=after)
+            end = window[end_n][1] if end_n is not None else None
+            # The lifting is worth naming when it falls in another
+            # stretch of the day than the fog came in on; inside the one
+            # stretch, "fog tonight" has said it, and "fog tonight,
+            # clearing overnight" would only say it again, worse.
+            if (end is not None and part_of_day(end) != part_of_day(start)
+                    and _has("fog_starting_ending", runtime)):
+                # The end is phrased after the start, so a night that
+                # runs into the morning says "tomorrow" once
+                ending = _time_phrase(end, now, runtime, after=start)
+                return (_ucfirst(_s("fog_starting_ending", runtime,
+                                    time=time, end=ending)), start, end)
+            if not _has("fog_starting", runtime):
+                return nothing
+            return _ucfirst(_s("fog_starting", runtime, time=time)), start, None
+        # A single foggy hour is not worth a sentence; there may be fog
+        # that is further on.
+        if end_n is None:
+            break
+        n = end_n + 1
+    return nothing
+
+
+# ---------------------------------------------------------------------------
+# Wind, and the cold
+# ---------------------------------------------------------------------------
+# Gusts worth a sentence, and gusts worth leading with, in km/h.  Short
+# of a gale, gusts are news only when they are more than the place is
+# used to, read off the rest of the forecast week the way the felt
+# temperature is: Honolulu's afternoon trade wind every day is the
+# climate, and the same speed after a calm week is worth a word.
+_GUSTS_NOTABLE_KMH = 40
+_GUSTS_GALE_KMH = 60
+_GUSTS_BEYOND_USUAL_KMH = 10
+
+
+def _gusts_usual(daily, day, runtime):
+    """The week's typical strongest gust, in km/h, leaving out `day`:
+    the middle of the other days' maxima, or None without them."""
+    days = daily.get("time") or []
+    maxima = daily.get("wind_gusts_10m_max") or []
+    others = sorted(runtime.wind_kmh(g) for d, g in zip(days, maxima)
+                    if g is not None and d != day)
+    if not others:
+        return None
+    return others[len(others) // 2]
+
+
+_WIND_PROSE_KEYS = {"km/h": "unit_kmh_prose", "m/s": "unit_ms_prose", "mph": "unit_mph_prose",
+                    "kn": "unit_kn_prose"}
+
+
+def _prose_wind_unit(runtime):
+    """The wind unit as a sentence writes it: spelled out where the
+    language does ("کیلومتر بر ساعت"), else the label the graph uses."""
+    key = _WIND_PROSE_KEYS.get(runtime.wind_unit)
+    if key and _has(key, runtime):
+        return _s(key, runtime)
+    return wind_unit_label(runtime)
+
+
+def _gusts(hourly, now, runtime, after=None, daily=None):
+    """"Gusts to 45 mph this afternoon", whether that is a gale, the
+    hour of the peak, and the speed as written."""
+    nothing = ("", False, None, "")
+    if not _has("gusts_to", runtime):
+        return nothing
+    gusts = hourly.get("wind_gusts_10m") or []
+    hours = [(i, dt) for i, dt in _hours_ahead(hourly, now)
+             if i < len(gusts) and gusts[i] is not None]
+    if not hours:
+        return nothing
+    i, dt = max(hours, key=lambda h: gusts[h[0]])
+    kmh = runtime.wind_kmh(gusts[i])
+    if kmh < _GUSTS_NOTABLE_KMH:
+        return nothing
+    if kmh < _GUSTS_GALE_KMH:
+        usual = _gusts_usual(daily or {}, dt.date().isoformat(), runtime)
+        if usual is not None and kmh - usual < _GUSTS_BEYOND_USUAL_KMH:
+            return nothing
+    speed = f"{gusts[i]:.0f}{_prose_sep(runtime)}{_prose_wind_unit(runtime)}"
+    return (_ucfirst(_s("gusts_to", runtime, speed=speed,
+                        time=_period_phrase(dt, now, runtime, after=after))),
+            kmh >= _GUSTS_GALE_KMH, dt, speed)
+
+
+def gusts_sentence(hourly, now, runtime=None, daily=None):
+    """Plain-text sentence for the strongest gusts of the day ahead."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _gusts(hourly, now, runtime, daily=daily)[0]
+
+
+def freeze_sentence(hourly, current, now, runtime=None):
+    """"Below freezing tonight, down to 28°": when the air is above
+    freezing now and will not be by morning.  Said of the night ahead
+    only, through nine tomorrow morning, and not when it is freezing
+    already, which the header shows."""
+    if runtime is None:
+        runtime = current_runtime(WeatherRuntime)
+    return _freeze(hourly, current, now, runtime)[0]
+
+
+def _freeze(hourly, current, now, runtime, after=None):
+    """The freeze sentence and the hour of the low."""
+    if not _has("freeze_tonight", runtime):
+        return "", None
+    temps = hourly.get("temperature_2m") or []
+    freezing = 0 if runtime.celsius else 32
+    morning = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    hours = [(i, dt) for i, dt in _hours_ahead(hourly, now)
+             if dt <= morning and i < len(temps) and temps[i] is not None]
+    if not hours:
+        return "", None
+    now_temp = current.get("temperature_2m")
+    if now_temp is None:
+        now_temp = temps[hours[0][0]]
+    if now_temp <= freezing:
+        return "", None
+    i, dt = min(hours, key=lambda h: temps[h[0]])
+    # Judged on the low as it is written: "below freezing, down to 32°"
+    # would contradict itself
+    if round(temps[i]) >= freezing:
+        return "", None
+    return (_ucfirst(_s("freeze_tonight", runtime, temp=_degrees(temps[i], runtime, signed=True),
+                        time=_period_phrase(dt, now, runtime, after=after))), dt)
+
+
+_theme.track_imports(globals(), "linecast.weather.style")

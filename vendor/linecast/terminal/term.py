@@ -1,0 +1,595 @@
+"""Terminal input, wakeup and resize notice, for POSIX and Windows.
+
+The live loop needs three things that the two platforms spell differently:
+
+  - cbreak input: keys delivered as they are typed, without echo.
+  - a wait that returns on a keypress, on a nudge from another thread, or
+    on a timeout, whichever comes first.
+  - notice that the window changed size.
+
+POSIX gets termios cbreak, select() over stdin and a self-pipe, and
+SIGWINCH.  Windows gets console modes, a kbhit() poll, and a comparison of
+the reported size in place of the signal.
+
+The one thing that does *not* differ is the byte stream.  With
+ENABLE_VIRTUAL_TERMINAL_INPUT set, the Windows console emits the same
+ANSI sequences a POSIX terminal does — \\033[A for up, SGR 1006 mouse
+reports — so terminal.keys' escape parsing is shared verbatim and only the
+plumbing under it is swapped out here.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import time as _time
+
+WINDOWS = sys.platform == "win32"
+
+# A cursor position query, and the reply it gets: \033[<row>;<col>R.
+# Every terminal answers it, and answers in order with everything sent
+# before it, so a query sent after a batch of output says when the
+# terminal has finished with the batch.  The colour probe sends one
+# after its questions, the live loop one after every frame, and the
+# teardown one after its last escapes.
+CPR_QUERY = b"\033[6n"
+CPR_REPLY = re.compile(rb"\033\[\d+;\d+R")
+
+# The name the terminal gives for itself when asked (XTVERSION, CSI > 0 q:
+# "Konsole 26.08.1", "foot(1.28.0)", "tmux 3.5a"), or None before the
+# width probe has asked or when it does not say.
+XTVERSION_QUERY = b"\033[>0q"
+XTVERSION_REPLY = re.compile(r"\033P>\|([^\033\a]*)")
+terminal_name = None
+
+
+def note_terminal_name(buf):
+    """Take the terminal's name from a probe's replies, if it gave one."""
+    global terminal_name
+    match = XTVERSION_REPLY.search(buf)
+    if match:
+        terminal_name = match.group(1).strip()
+    return terminal_name
+
+
+# Whether this terminal has answered a cursor query: None until one is
+# sent, False after one went unanswered, True once any comes back.
+answered = None
+
+# Input read but not yet taken, which every read takes first.  On Windows
+# the console hands over a whole escape sequence per read while terminal.keys
+# walks input a byte at a time, and the remainder waits here rather than
+# trust the console to hold it.  Anywhere, a byte terminal.keys read too far
+# goes back here (unread).
+_pending = bytearray()
+
+# How often the Windows wait wakes to re-check kbhit() and the window size.
+# Small enough that a keypress feels immediate, large enough to idle cheaply.
+_POLL = 0.015
+
+if not WINDOWS:
+    import select
+    import signal
+    import termios
+    import tty
+else:
+    import ctypes
+    import msvcrt
+    import threading
+    from ctypes import wintypes
+
+    _k32 = ctypes.windll.kernel32
+    _ENABLE_PROCESSED_INPUT = 0x0001
+    _ENABLE_LINE_INPUT = 0x0002
+    _ENABLE_ECHO_INPUT = 0x0004
+    _ENABLE_WINDOW_INPUT = 0x0008
+    _ENABLE_MOUSE_INPUT = 0x0010
+    _ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+    _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+    def _console_handle(fd):
+        """The console handle behind fd, or None if fd is not a console."""
+        try:
+            handle = msvcrt.get_osfhandle(fd)
+        except Exception:
+            return None
+        mode = wintypes.DWORD()
+        if not _k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return None  # a pipe or a file: no console modes to set
+        return handle
+
+    def _get_mode(handle):
+        mode = wintypes.DWORD()
+        if not _k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return None
+        return mode.value
+
+    def _pipe_ready(fd):
+        """Whether a read on a non-console descriptor would return now.
+
+        select() cannot see a pipe on Windows and a bare os.read would
+        block until something arrives, so ask the pipe directly.  A
+        handle that is not a pipe -- a plain file -- never blocks, so it
+        counts as ready.
+        """
+        try:
+            handle = msvcrt.get_osfhandle(fd)
+        except Exception:
+            return True
+        avail = wintypes.DWORD()
+        if not _k32.PeekNamedPipe(handle, None, 0, None,
+                                  ctypes.byref(avail), None):
+            return True  # not a pipe: the read returns immediately
+        return avail.value > 0
+
+    def _ready(fd, console):
+        """Input waiting on fd, whether it is a console or a pipe."""
+        return msvcrt.kbhit() if console else _pipe_ready(fd)
+
+
+# ---------------------------------------------------------------------------
+# Byte-level input, which terminal.keys reads
+# ---------------------------------------------------------------------------
+def read_byte(fd):
+    """One byte of input, or None at EOF."""
+    if _pending:
+        return bytes([_pending.pop(0)])
+    if WINDOWS:
+        try:
+            chunk = os.read(fd, 1024)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        _pending.extend(chunk)
+        return bytes([_pending.pop(0)])
+    try:
+        data = os.read(fd, 1)
+    except OSError:
+        return None
+    return data or None
+
+
+def unread(data):
+    """Put bytes back, to be read before anything the terminal sends
+    next: the start of the next sequence, read while finishing this one."""
+    _pending[:0] = data
+
+
+def in_foreground(fd):
+    """Whether this process's job has the terminal on `fd`, so a probe
+    may take it.  From a background job (`linecast moon --oneline &`)
+    the raw mode would stop the process with SIGTTOU and the read with
+    SIGTTIN, and the terminal's answers would go to the shell.  A tty
+    that is not this process's controlling terminal has no job to stop."""
+    if WINDOWS:
+        return True
+    try:
+        return os.tcgetpgrp(fd) == os.getpgrp()
+    except OSError:
+        return True
+
+
+def mark_answered():
+    """Note that the terminal answered a cursor position query."""
+    global answered
+    answered = True
+
+
+def read_until_reply(fd, timeout, replies=1):
+    """Read input until the terminal answers a cursor position query.
+
+    For a probe that has just sent its questions with CPR_QUERY after
+    them: returns (bytes read, whether the reply came) after the reply
+    or after `timeout` seconds, whichever is first.  The bytes hold the
+    answers that preceded the reply.  On a timeout the input queue is
+    flushed, so an answer that arrived late does not reach whatever
+    reads the terminal next.
+
+    `replies` is how many replies to wait for, when queries sent
+    earlier are still unanswered: the terminal answers them in order,
+    so the last reply is the one that says it has read everything.
+    """
+    global answered
+    buf = bytearray()
+    deadline = _time.monotonic() + timeout
+    while True:
+        left = deadline - _time.monotonic()
+        if left <= 0 or not wait_readable(fd, left):
+            break
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+        seen = len(CPR_REPLY.findall(buf))
+        if seen:
+            answered = True
+        if seen >= replies:
+            return bytes(buf), True
+    if answered is None:
+        answered = False
+    flush_input(fd)
+    return bytes(buf), False
+
+
+def flush_input(fd):
+    """Discard input the terminal has sent and nothing has read."""
+    _pending.clear()
+    if WINDOWS:
+        handle = _console_handle(fd)
+        if handle is not None:
+            _k32.FlushConsoleInputBuffer(handle)
+        return
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+
+
+def frame_sync_enabled():
+    """Whether the live loop waits for the terminal to finish one frame
+    before it sends the next.  LINECAST_FRAME_SYNC=0 turns it off."""
+    raw = str(os.environ.get("LINECAST_FRAME_SYNC", "1")).strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def wait_readable(fd, timeout):
+    """Whether a byte is available within `timeout` seconds."""
+    if _pending:
+        return True
+    if WINDOWS:
+        console = _console_handle(fd) is not None
+        deadline = _time.monotonic() + timeout
+        while True:
+            if _ready(fd, console):
+                return True
+            left = deadline - _time.monotonic()
+            if left <= 0:
+                return False
+            _time.sleep(min(_POLL, left))
+    try:
+        return bool(select.select([fd], [], [], timeout)[0])
+    except (InterruptedError, OSError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# The live loop's terminal
+# ---------------------------------------------------------------------------
+_current = None  # the LiveTerminal a loop is running on, for nudge()
+
+
+class LiveTerminal:
+    """Cbreak input plus a wakeup any thread can pull.
+
+    install() takes over the terminal's settings and, on POSIX, the signal
+    handlers; close() puts all of it back and is safe to call twice.
+    """
+
+    def __init__(self, fd):
+        self.fd = fd
+        self._closed = False
+        # Ctrl-Z was pressed and the loop has yet to stop (suspend())
+        self.suspend_pending = False
+        self._old_settings = None
+        self._prev_handlers = {}
+        self._wake_r = self._wake_w = None
+        # wake() runs on any thread and close() on the loop's: the lock
+        # keeps a nudge from writing to the pipe as it closes, or to a
+        # file that has just been given its descriptor number
+        import threading
+        self._wake_lock = threading.Lock()
+        self._event = None
+        self._old_in_mode = self._old_out_mode = None
+        self._handle_in = self._handle_out = None
+        self._size = None
+        self._console = None
+
+    # -- setup -------------------------------------------------------------
+    def install(self):
+        """Take the wakeup channel and resize notification."""
+        global _current
+        if WINDOWS:
+            self._event = threading.Event()
+            self._size = _terminal_size()
+        else:
+            self._wake_r, self._wake_w = os.pipe()
+            os.set_blocking(self._wake_r, False)
+            os.set_blocking(self._wake_w, False)
+            # os.write to a pipe is async-signal-safe per POSIX;
+            # threading.Event.set() is not, and deadlocks when SIGWINCH
+            # re-enters itself during a rapid resize.
+            def _on_winch(*_):
+                if self._wake_w is None:
+                    return  # the loop has ended and its pipe is closed
+                try:
+                    os.write(self._wake_w, b'\x00')
+                except OSError:
+                    pass
+            self._prev_handlers[signal.SIGWINCH] = signal.signal(
+                signal.SIGWINCH, _on_winch)
+
+            # Route SIGTERM/SIGHUP/SIGQUIT through SystemExit so `pkill
+            # radar` or a closed terminal still runs the caller's finally --
+            # otherwise the alternate screen and mouse reporting are left on.
+            def _exit_on_signal(signum, _frame):
+                sys.exit(128 + signum)
+
+            for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+                try:
+                    self._prev_handlers[_sig] = signal.signal(
+                        _sig, _exit_on_signal)
+                except (ValueError, OSError):
+                    pass
+
+            # Ctrl-Z stops the process where it stands, and the shell would
+            # get the alternate screen, mouse reporting and cbreak along
+            # with its prompt.  The handler only asks: the loop hands the
+            # terminal back between frames and stops itself (suspend()).
+            # A shell that runs us with the signal ignored keeps it so.
+            def _on_tstp(*_):
+                self.suspend_pending = True
+                _on_winch()
+
+            try:
+                if signal.getsignal(signal.SIGTSTP) is not signal.SIG_IGN:
+                    self._prev_handlers[signal.SIGTSTP] = signal.signal(
+                        signal.SIGTSTP, _on_tstp)
+            except (ValueError, OSError):
+                pass
+        _current = self
+
+    def set_cbreak(self):
+        """Keys as they are typed, no echo."""
+        if WINDOWS:
+            self._handle_in = _console_handle(self.fd)
+            # stdout may be captured or replaced, in which case it has no
+            # descriptor to ask about; the console's own is 1 regardless.
+            try:
+                out_fd = sys.stdout.fileno()
+            except Exception:
+                out_fd = 1
+            self._handle_out = _console_handle(out_fd)
+            if self._handle_in is not None:
+                self._old_in_mode = _get_mode(self._handle_in)
+                mode = self._old_in_mode & ~(
+                    _ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
+                    | _ENABLE_PROCESSED_INPUT)
+                # VIRTUAL_TERMINAL_INPUT is what makes the console speak
+                # ANSI; WINDOW and MOUSE input keep those events flowing
+                # into the same stream rather than being dropped.
+                mode |= (_ENABLE_VIRTUAL_TERMINAL_INPUT
+                         | _ENABLE_WINDOW_INPUT | _ENABLE_MOUSE_INPUT)
+                _k32.SetConsoleMode(self._handle_in, mode)
+            if self._handle_out is not None:
+                self._old_out_mode = _get_mode(self._handle_out)
+                _k32.SetConsoleMode(
+                    self._handle_out,
+                    self._old_out_mode | _ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+            return
+        self._old_settings = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        # Cbreak keeps ISIG, so the tty still turns the QUIT character
+        # (^\, 0x1C) into SIGQUIT -- and terminals following xterm send
+        # 0x1C for ctrl-4, which macOS's screenshot shortcut (cmd-ctrl-
+        # shift-4) delivers to the terminal on its way through.  The
+        # default action kills the process without the finally block, and
+        # the shell inherits a terminal with mouse reporting still on.
+        # Disable the character: the keypress becomes an ordinary byte the
+        # loop ignores, and a screenshot leaves the view standing.
+        try:
+            attrs = termios.tcgetattr(self.fd)
+            vdisable = getattr(termios, "_POSIX_VDISABLE", None)
+            if vdisable is None:
+                # Only ask the fd when the constant is missing: fpathconf
+                # refuses anything that is not a terminal.
+                vdisable = os.fpathconf(self.fd, "PC_VDISABLE")
+            attrs[6][termios.VQUIT] = vdisable
+            termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        except (OSError, ValueError, IndexError, termios.error):
+            pass
+
+    # -- running -----------------------------------------------------------
+    def leads_job(self):
+        """Whether this process leads its job.  Under a wrapper that does
+        not exec it -- uvx, a shell script -- the wrapper leads, and on
+        ctrl-Z stops at once and hands the shell the terminal while the
+        loop is still giving it back."""
+        return WINDOWS or os.getpgrp() == os.getpid()
+
+    def suspend(self, hand_back=None):
+        """Stop, as ctrl-Z asked: `hand_back()` writes the escapes that
+        give the terminal back, the terminal's own settings go back, the
+        process stops, and once resumed it is in cbreak again, for the
+        caller to take and repaint."""
+        self.suspend_pending = False
+        if WINDOWS or self._closed:
+            return
+        # If a wrapper has stopped first, the shell has the terminal, and
+        # a read or a settings change from here would stop the process a
+        # second time (SIGTTIN, SIGTTOU); ignored, they fail instead
+        quiet = {}
+        for sig in (signal.SIGTTIN, signal.SIGTTOU):
+            quiet[sig] = signal.signal(sig, signal.SIG_IGN)
+        try:
+            if hand_back is not None:
+                hand_back()
+            if self._old_settings is not None:
+                try:
+                    termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old_settings)
+                except termios.error:
+                    pass
+            handler = signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+            try:
+                # raise() stops this thread, and with it the process,
+                # before it returns
+                signal.raise_signal(signal.SIGTSTP)
+            finally:
+                signal.signal(signal.SIGTSTP, handler)
+        finally:
+            for sig, previous in quiet.items():
+                signal.signal(sig, previous)
+        # `fg` gives the terminal back as it was when the job stopped:
+        # cooked
+        self.set_cbreak()
+
+    def wake(self):
+        """Ask the loop to repaint now. Safe from any thread."""
+        if WINDOWS:
+            if self._event is not None:
+                self._event.set()
+            return
+        with self._wake_lock:
+            if self._wake_w is None:
+                return
+            try:
+                os.write(self._wake_w, b'\x00')
+            except OSError:
+                pass
+
+    def _is_console(self):
+        if self._console is None:
+            self._console = _console_handle(self.fd) is not None
+        return self._console
+
+    def drain(self):
+        """Discard wakeups queued before the frame about to be drawn."""
+        if WINDOWS:
+            if self._event is not None:
+                self._event.clear()
+            return
+        if self._wake_r is None:
+            return
+        try:
+            os.read(self._wake_r, 512)
+        except OSError:
+            pass
+
+    def wait(self, timeout):
+        """Block up to `timeout`. Returns 'input', 'wake' or 'timeout'."""
+        if _pending:
+            return 'input'
+        if WINDOWS:
+            deadline = _time.monotonic() + timeout
+            while True:
+                if _ready(self.fd, self._is_console()):
+                    return 'input'
+                if self._event.is_set():
+                    self._event.clear()
+                    return 'wake'
+                size = _terminal_size()
+                if size != self._size:
+                    self._size = size
+                    return 'wake'  # stands in for SIGWINCH
+                left = deadline - _time.monotonic()
+                if left <= 0:
+                    return 'timeout'
+                _time.sleep(min(_POLL, left))
+        try:
+            ready, _, _ = select.select(
+                [self.fd, self._wake_r], [], [], timeout)
+        except (InterruptedError, OSError):
+            return 'timeout'
+        # Input first: a view animating off a ticker has a wakeup pending
+        # nearly always, and a key must not wait behind them. The wakeup
+        # stays in the pipe for the next wait, or for the drain before
+        # the repaint the key causes.
+        if self.fd in ready:
+            return 'input'
+        if self._wake_r in ready:
+            try:
+                os.read(self._wake_r, 512)  # coalesce a burst of resizes
+            except OSError:
+                pass
+            return 'wake'
+        return 'timeout'
+
+    # -- teardown ----------------------------------------------------------
+    def settle(self, timeout, replies=1):
+        """Discard what the terminal is still sending, before the tty goes
+        back to the shell.
+
+        The loop has just written its last escapes with CPR_QUERY after
+        them.  Whatever the terminal sends before that reply -- the rest
+        of a colour probe's answers, mouse reports it emitted before it
+        read the escape turning them off -- would otherwise land on the
+        shell's command line, and on macOS the cooked tty echoes them as
+        it goes.  Reads and drops input until the reply or `timeout`
+        seconds, then flushes the queue.  `replies` counts the queries
+        still unanswered, this last one included: a frame's query the
+        terminal had yet to answer when the loop ended is answered
+        first, and stopping at that reply would leave the last one for
+        the shell.
+        """
+        if self._closed:
+            return
+        if not WINDOWS and timeout > 0:
+            read_until_reply(self.fd, timeout, replies=max(1, replies))
+        flush_input(self.fd)
+
+    def close(self):
+        """Put the terminal, the handlers and the wakeup channel back."""
+        global _current
+        if self._closed:
+            return
+        self._closed = True
+        if _current is self:
+            _current = None
+        _pending.clear()
+        if WINDOWS:
+            if self._handle_in is not None and self._old_in_mode is not None:
+                _k32.SetConsoleMode(self._handle_in, self._old_in_mode)
+            if self._handle_out is not None and self._old_out_mode is not None:
+                _k32.SetConsoleMode(self._handle_out, self._old_out_mode)
+            return
+        # The SIGWINCH handler goes back before the pipe closes.  A background
+        # fetch that lands after the loop still calls nudge(); with the
+        # handler left installed, its write would go to whatever file reused
+        # the pipe's descriptor number.
+        for _sig, _handler in self._prev_handlers.items():
+            try:
+                signal.signal(_sig, _handler)
+            except (ValueError, OSError):
+                pass
+        with self._wake_lock:
+            pipe = (self._wake_r, self._wake_w)
+            self._wake_r = self._wake_w = None
+            for _fd in pipe:
+                if _fd is not None:
+                    try:
+                        os.close(_fd)
+                    except OSError:
+                        pass
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(
+                    self.fd, termios.TCSADRAIN, self._old_settings)
+            except Exception:
+                pass  # the tty may already be gone (SIGHUP)
+
+
+def _terminal_size():
+    """The tty's own size, or None where it has none to give.  A serial
+    console, or a pty nobody sized (some `docker exec -t` and `ssh -tt`
+    sessions), reports 0x0, and a frame drawn to that would be empty;
+    the caller falls back as for no tty at all."""
+    try:
+        size = os.get_terminal_size()
+    except OSError:
+        return None
+    return size if size.columns > 0 and size.lines > 0 else None
+
+
+def nudge():
+    """Ask a running live loop to repaint now, from any thread.
+
+    Coalesces harmlessly when several arrive at once, and does nothing when
+    no loop is running, so background work can call it unconditionally.
+    """
+    term = _current
+    if term is not None:
+        term.wake()

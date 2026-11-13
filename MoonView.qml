@@ -197,7 +197,11 @@ Item {
 
         InfoPair {
           label: "Next full"
-          value: view.payload && view.payload.next_full ? Model.shortDate(view.payload.next_full) : ""
+          // linecast 2 names the full moon ("Beaver"); earlier ones don't.
+          value: view.payload && view.payload.next_full
+            ? Model.shortDate(view.payload.next_full)
+              + (view.payload.next_full_name ? " · " + view.payload.next_full_name : "")
+            : ""
           foreground: view.foreground
           fontFamily: view.fontFamily
         }

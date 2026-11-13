@@ -1,0 +1,269 @@
+"""Shared weather rendering palette and low-level color/format helpers."""
+
+from linecast._i18n import fmt_percent
+from linecast.terminal.color import bg, fg, interp_stops
+from linecast.terminal import theme as _theme
+from linecast.terminal.theme import (
+    best_contrast,
+    clamp_hue,
+    contrast_ratio,
+    darken,
+    ensure_contrast,
+    hue_distance,
+    is_light_theme,
+    lerp_rgb,
+    lighten,
+    luminance,
+    neutral_tone,
+    surface_bg,
+)
+
+# ---------------------------------------------------------------------------
+# Palette
+# ---------------------------------------------------------------------------
+def _deepen(color, amount, minimum):
+    """Darken color by amount, but on a dark page no further than the
+    minimum contrast allows.  ensure_contrast would lift a color that went
+    too dark back toward white, which greys it."""
+    for step in range(round(amount * 100), -1, -1):
+        candidate = darken(color, step / 100)
+        if contrast_ratio(candidate, _theme.theme_bg) >= minimum:
+            return candidate
+    return ensure_contrast(color, _theme.theme_bg, minimum=minimum)
+
+
+def _rebuild():
+    global TEXT_RGB, DIM_RGB, MUTED_RGB, WIND_RGB, BLUE_RGB, CYAN_RGB
+    global GREEN_RGB, YELLOW_RGB, RED_RGB, MAGENTA_RGB, BRIGHT_YELLOW_RGB
+    global ALERT_BLUE_BASE_RGB, TEMP_COLORS, PRECIP_RAIN_RGB, PRECIP_SNOW_RGB
+    global PRECIP_MIX_RGB, PRECIP_STORM_RGB, ALERT_RED_RGB, ALERT_AMBER_RGB
+    global ALERT_YELLOW_RGB, ALERT_BLUE_RGB, CHART_BG_NIGHT_RGB
+    global CHART_BG_DAY_RGB, CHART_HOVER_RGB, CHART_NOW_RGB, SUNRISE_LABEL_RGB
+    global SUNSET_LABEL_RGB, TOOLTIP_BG_RGB, TOOLTIP_TEXT_RGB, MODAL_BG_RGB
+    global MODAL_BORDER_RGB, LINK_RGB, TEXT, DIM, MUTED, PRECIP, PRECIP_RAIN
+    global ALERT_AMBER, WIND_COLOR, CLOUD_RGB
+    global CHIP_BG_RGB, CHIP_FG_RGB, CHIP, TOOLTIP_DIM_RGB
+    TEXT_RGB = ensure_contrast(_theme.theme_fg, _theme.theme_bg, minimum=4.5)
+    DIM_RGB = ensure_contrast(neutral_tone(0.32), _theme.theme_bg, minimum=2.0)
+    MUTED_RGB = ensure_contrast(neutral_tone(0.48), _theme.theme_bg, minimum=2.5)
+    WIND_RGB = ensure_contrast(neutral_tone(0.68), _theme.theme_bg, minimum=3.0)
+    # Full cloud cover; the strip fades from the background to this.
+    CLOUD_RGB = ensure_contrast(neutral_tone(0.9), _theme.theme_bg, minimum=4.0)
+
+    BLUE_RGB = best_contrast((_theme.theme_ansi[4], _theme.theme_ansi[12]), minimum=2.1)
+    CYAN_RGB = best_contrast((_theme.theme_ansi[6], _theme.theme_ansi[14]), minimum=2.1)
+    GREEN_RGB = best_contrast((_theme.theme_ansi[2], _theme.theme_ansi[10]), minimum=2.1)
+    YELLOW_RGB = best_contrast((_theme.theme_ansi[3], _theme.theme_ansi[11]), minimum=2.1)
+    RED_RGB = best_contrast((_theme.theme_ansi[1], _theme.theme_ansi[9]), minimum=2.1)
+    MAGENTA_RGB = best_contrast((_theme.theme_ansi[5], _theme.theme_ansi[13]), minimum=2.1)
+    BRIGHT_YELLOW_RGB = ensure_contrast(_theme.theme_ansi[11], _theme.theme_bg, minimum=2.4)
+    ALERT_BLUE_BASE_RGB = best_contrast(
+        (_theme.theme_ansi[12], _theme.theme_ansi[14], _theme.theme_ansi[6]), minimum=2.1)
+
+    # Below freezing the blue deepens to 15°F, then pales toward ice at
+    # -40°, staying blue and away from the hot end's crimson.  The
+    # deeper blue is the darker of the theme's two, or its blue
+    # darkened, whichever is deeper.  The ice starts from the bluer of
+    # the two, its hue turned to within 20° of a sky blue, since on some
+    # themes the blue is a teal or a violet.  A light theme's page is
+    # already pale, so there the ice darkens to a navy instead.
+    deep_blue = min((_theme.theme_ansi[4], _theme.theme_ansi[12], darken(BLUE_RGB, 0.2)),
+                    key=luminance)
+    ice_blue = clamp_hue(min((_theme.theme_ansi[4], _theme.theme_ansi[12]),
+                             key=lambda c: hue_distance(c, 215)), 215, 20)
+    ice = darken(ice_blue, 0.55) if is_light_theme() else lighten(ice_blue, 0.6)
+    # Past red the heat turns crimson and deepens toward a maroon.  The
+    # crimson is the theme's red with its hue turned to within 8° of 340°;
+    # turning it toward the theme's magenta would give a plum on themes
+    # whose magenta is a lavender.  On a dark page the maroon stops at
+    # the contrast floor.
+    crimson = clamp_hue(RED_RGB, 340, 8)
+    TEMP_COLORS = [
+        (-40, ensure_contrast(ice, _theme.theme_bg, minimum=2.1)),
+        (15, ensure_contrast(deep_blue, _theme.theme_bg, minimum=2.1)),
+        (32, BLUE_RGB),
+        (45, CYAN_RGB),
+        (55, GREEN_RGB),
+        (65, ensure_contrast(lerp_rgb(GREEN_RGB, YELLOW_RGB, 0.45), _theme.theme_bg, minimum=2.1)),
+        (72, YELLOW_RGB),
+        (82, ensure_contrast(lerp_rgb(YELLOW_RGB, RED_RGB, 0.45), _theme.theme_bg, minimum=2.1)),
+        (95, RED_RGB),
+        (105, _deepen(crimson, 0.15, minimum=2.1)),
+        (115, _deepen(crimson, 0.45, minimum=2.1)),
+    ]
+
+    PRECIP_RAIN_RGB = BLUE_RGB
+    PRECIP_SNOW_RGB = best_contrast((_theme.theme_ansi[15], _theme.theme_ansi[8]), minimum=2.8)
+    PRECIP_MIX_RGB = MAGENTA_RGB
+    PRECIP_STORM_RGB = YELLOW_RGB
+    ALERT_RED_RGB = RED_RGB
+    ALERT_AMBER_RGB = YELLOW_RGB
+    ALERT_YELLOW_RGB = BRIGHT_YELLOW_RGB
+    ALERT_BLUE_RGB = ALERT_BLUE_BASE_RGB
+
+    # Day/night chart tinting built from theme background + cool anchors.
+    if is_light_theme():
+        CHART_BG_NIGHT_RGB = darken(lerp_rgb(_theme.theme_bg, BLUE_RGB, 0.06), 0.12)
+        CHART_BG_DAY_RGB = lighten(lerp_rgb(_theme.theme_bg, CYAN_RGB, 0.03), 0.03)
+    else:
+        CHART_BG_NIGHT_RGB = darken(lerp_rgb(_theme.theme_bg, BLUE_RGB, 0.12), 0.08)
+        CHART_BG_DAY_RGB = lighten(lerp_rgb(_theme.theme_bg, CYAN_RGB, 0.06), 0.05)
+
+    CHART_HOVER_RGB = ensure_contrast(surface_bg(0.36), CHART_BG_NIGHT_RGB, minimum=1.5)
+    # The current-time divider: the same washed blue as the tides now line,
+    # brighter than a midnight divider but quieter than the data colors.
+    CHART_NOW_RGB = ensure_contrast(
+        lerp_rgb(best_contrast((_theme.theme_ansi[4], _theme.theme_ansi[12]), minimum=2.0),
+                 _theme.theme_bg, 0.30),
+        minimum=1.8,
+    )
+    SUNRISE_LABEL_RGB = ensure_contrast(lerp_rgb(YELLOW_RGB, RED_RGB, 0.20), _theme.theme_bg,
+                                        minimum=2.0)
+    SUNSET_LABEL_RGB = ensure_contrast(lerp_rgb(RED_RGB, MAGENTA_RGB, 0.25), _theme.theme_bg,
+                                       minimum=2.0)
+    TOOLTIP_BG_RGB, TOOLTIP_TEXT_RGB, TOOLTIP_DIM_RGB = _theme.chip_inks(TEXT_RGB)
+    MODAL_BG_RGB = darken(lerp_rgb(_theme.theme_bg, BLUE_RGB, 0.04),
+                          0.10 if not is_light_theme() else 0.06)
+    MODAL_BORDER_RGB = ensure_contrast(DIM_RGB, MODAL_BG_RGB, minimum=2.2)
+    LINK_RGB = ensure_contrast(_theme.theme_ansi[4], MODAL_BG_RGB, minimum=3.0)
+    # The location chip in the header: the tides station pill's surface,
+    # with the full text color so the place is the brightest thing there.
+    CHIP_BG_RGB = surface_bg(0.08)
+    CHIP_FG_RGB = ensure_contrast(TEXT_RGB, CHIP_BG_RGB, minimum=4.5)
+
+    TEXT = fg(*TEXT_RGB)
+    DIM = fg(*DIM_RGB)
+    MUTED = fg(*MUTED_RGB)
+    PRECIP = fg(*PRECIP_RAIN_RGB)  # blue (rain) — kept for daily text
+    PRECIP_RAIN = fg(*PRECIP_RAIN_RGB)
+    ALERT_AMBER = fg(*ALERT_AMBER_RGB)
+    WIND_COLOR = fg(*WIND_RGB)
+
+    CHIP = (fg(*CHIP_BG_RGB), bg(*CHIP_BG_RGB), fg(*CHIP_FG_RGB))
+
+
+_rebuild()
+_theme.on_reload(_rebuild)
+SPARKLINE = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"  # ▁▂▃▄▅▆▇█
+
+
+# Text knocked out of a filled bar or pill reads against the fill, not
+# against the page: the fill is a temperature or an alert level, and can
+# be anything from deep blue to red. The ink is one of the two poles.
+KNOCKOUT_DARK_RGB = (20, 20, 25)
+KNOCKOUT_LIGHT_RGB = (255, 255, 255)
+
+
+def _knockout_ink(fill):
+    """Ink for text drawn on a cell filled with ``fill``."""
+    return best_contrast((KNOCKOUT_DARK_RGB, KNOCKOUT_LIGHT_RGB), fill,
+                         minimum=4.5)
+
+
+def _temp_color(temp, runtime):
+    temp_f = temp * 9 / 5 + 32 if runtime.celsius else temp
+    return interp_stops(TEMP_COLORS, temp_f)
+
+
+def _colored_temp(temp, runtime, suffix=""):
+    r, g, b = _temp_color(temp, runtime)
+    return f"{fg(r, g, b)}{round(temp)}{suffix}"
+
+
+def notable_moisture(humidity, dew_point, runtime, deg):
+    """The air's moisture when it is worth a mention, as (string key,
+    reading drawn in its ink): the dew point when it is uncomfortably
+    high (60°F, about 15°C, or more), else the humidity when the air is
+    very damp or very dry.  None when neither is notable, or either
+    reading is missing.  `deg` follows the dew point's figure."""
+    if humidity is None or dew_point is None:
+        return None
+    dew_f = dew_point * 9 / 5 + 32 if runtime.celsius else dew_point
+    if dew_f >= 60:
+        return "dew_pt", _colored_temp(dew_point, runtime, deg)
+    if humidity >= 70 or humidity <= 25:
+        return "humidity", fmt_percent(humidity, runtime)
+    return None
+
+
+def _precip_type(wmo_code):
+    """Infer precipitation type from WMO weather code."""
+    if wmo_code in (71, 73, 75, 77, 85, 86):
+        return "Snow"
+    if wmo_code in (56, 57, 66, 67):
+        return "Mix"
+    return "Rain"
+
+
+def _rebuild_scales():
+    global AQI_COLORS, INDIA_AQI_COLORS, AQHI_COLORS, UV_COLOR
+    AQI_COLORS = [
+        (0, GREEN_RGB),
+        (51, YELLOW_RGB),
+        (101, ensure_contrast(lerp_rgb(YELLOW_RGB, RED_RGB, 0.45), _theme.theme_bg, minimum=2.1)),
+        (151, RED_RGB),
+        (201, MAGENTA_RGB),
+    ]
+
+    # The CPCB scale runs to 500 with wider bands: Satisfactory to 100,
+    # Moderate to 200, Poor to 300, Very Poor to 400, Severe past it.
+    INDIA_AQI_COLORS = [
+        (0, GREEN_RGB),
+        (101, YELLOW_RGB),
+        (201, ensure_contrast(lerp_rgb(YELLOW_RGB, RED_RGB, 0.45), _theme.theme_bg, minimum=2.1)),
+        (301, RED_RGB),
+        (401, MAGENTA_RGB),
+    ]
+    # Canada's AQHI: low risk to 3, moderate to 6, high to 10, very
+    # high past it.
+    AQHI_COLORS = [
+        (1, GREEN_RGB),
+        (4, YELLOW_RGB),
+        (7, RED_RGB),
+        (11, MAGENTA_RGB),
+    ]
+    UV_COLOR = fg(*ensure_contrast(lerp_rgb(YELLOW_RGB, RED_RGB, 0.30), _theme.theme_bg,
+                                   minimum=2.5))
+
+
+_rebuild_scales()
+_theme.on_reload(_rebuild_scales)
+
+
+def _aqi_color(aqi):
+    """ANSI fg escape for a US AQI value."""
+    return fg(*interp_stops(AQI_COLORS, aqi))
+
+
+def _india_aqi_color(aqi):
+    """ANSI fg escape for a CPCB National AQI value."""
+    return fg(*interp_stops(INDIA_AQI_COLORS, aqi))
+
+
+def _aqhi_color(aqhi):
+    """ANSI fg escape for a Canadian AQHI value."""
+    return fg(*interp_stops(AQHI_COLORS, aqhi))
+
+
+def _precip_rgb(wmo_code):
+    """RGB for precipitation type based on WMO code."""
+    if wmo_code in (71, 73, 75, 77, 85, 86):
+        return PRECIP_SNOW_RGB
+    if wmo_code in (56, 57, 66, 67):
+        return PRECIP_MIX_RGB
+    if wmo_code in (95, 96, 99):
+        return PRECIP_STORM_RGB
+    return PRECIP_RAIN_RGB
+
+
+def _precip_color(wmo_code):
+    """ANSI color for precipitation type based on WMO code."""
+    return fg(*_precip_rgb(wmo_code))
+
+
+# Hourly precipitation that fills the bar: about 5 mm/hr, the low end of
+# "heavy rain".  Anything above it draws at full height.  The bar's height
+# is the square root of the fraction, so 0.1 mm/hr drizzle still shows as
+# a stub and the range between drizzle and a downpour is not crushed into
+# the bottom eighth of a cell.
+PRECIP_BAR_FULL = {"mm": 5.0, "inch": 0.2}
