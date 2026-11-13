@@ -331,12 +331,15 @@ Item {
       }
     }
 
+    // The forecast in words: the paragraph under the TUI's graph, which
+    // ends on the comparison with yesterday. A linecast too old to write
+    // one still gives that comparison alone.
     Text {
       textFormat: Text.PlainText
-      visible: !!(view.payload && view.payload.summary) && !view.locMenuOpen
+      visible: text !== "" && !view.locMenuOpen
       width: parent.width
       wrapMode: Text.WordWrap
-      text: view.payload ? (view.payload.summary || "") : ""
+      text: view.payload ? String(view.payload.narrative || view.payload.summary || "") : ""
       color: view.muted
       font.family: view.fontFamily
       font.pixelSize: Style.font.body
@@ -927,6 +930,14 @@ Item {
           foreground: view.foreground
           fontFamily: view.fontFamily
         }
+
+        // The ten-year average high and low for this time of year.
+        InfoPair {
+          label: "Average"
+          value: Model.averageLine(view.payload ? view.payload.historical : null)
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
       }
 
       Column {
@@ -951,6 +962,15 @@ Item {
           label: "UV now"
           value: view.hourly.length > 0 && Model.num(view.hourly[0].uv_index, -1) >= 0
             ? String(Math.round(view.hourly[0].uv_index)) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+
+        // Today's high against that average, in the dashboard's words.
+        InfoPair {
+          label: "Today"
+          value: Model.averageComparison(view.today ? view.today.high : null,
+                                         view.payload ? view.payload.historical : null, view.tempUnit)
           foreground: view.foreground
           fontFamily: view.fontFamily
         }
@@ -1133,12 +1153,13 @@ Item {
           model: [
             { name: "radar", label: "Radar", icon: "󰼯", tip: "Live precipitation radar, animated" },
             { name: "maps", label: "Maps", icon: "󰍎", tip: "Terrain, streets, and the globe" },
+            { name: "sky", label: "Sky", icon: "󰓎", tip: "The stars and planets overhead, as you would see them" },
             { name: "weather", label: "Weather", icon: "󰆍", tip: "The full forecast, live" }
           ]
 
           Button {
             required property var modelData
-            width: (parent.width - Style.space(6) * 2) / 3
+            width: (parent.width - Style.space(6) * 3) / 4
             iconText: modelData.icon
             text: modelData.label
             tooltipText: modelData.tip

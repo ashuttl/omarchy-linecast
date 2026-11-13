@@ -5,10 +5,13 @@ import qs.Ui
 import "Model.js" as Model
 
 // Sunshine face: countdown to the next sunrise/sunset over the TUI's
-// solar arc — the day as a sine wave over a horizon line, the sky above
-// it colored for the sun's elevation right now, warm near the sun and
-// cool away from it, the sun glowing at its position — with sunrise, day
-// length, and sunset beneath. Fed by `linecast sunshine --json`.
+// solar arc — the sun's height through the day against a horizon line,
+// on a scale the year fits in, so the arc rides high in summer and low
+// in winter; the sky above the horizon colored for the sun's elevation
+// right now, warm near the sun and cool away from it, the sun glowing at
+// its position — with sunrise, day length, and sunset beneath, and the
+// day's hours in a tradition's reckoning when linecast is set to one.
+// Fed by `linecast sunshine --json`.
 Item {
   id: view
 
@@ -29,13 +32,40 @@ Item {
 
   readonly property var payload: feed.payload
 
-  // Ticks while shown so the countdown and sun position stay honest.
-  property double nowMs: Date.now()
+  // The payload's times are local to the place and carry no zone, so
+  // "now" is kept on the place's clock too: this machine's, moved by
+  // however far the place's wall clock stood from it at the fetch (zones
+  // sit on quarter hours). Ticks while shown so the countdown and sun
+  // position stay honest.
+  readonly property double placeShiftMs: {
+    var fetched = payload ? Model.parseIsoLocal(payload.fetched_at) : NaN
+    if (isNaN(fetched) || !feed.fetchedAtMs) return 0
+    return Math.round((fetched - feed.fetchedAtMs) / 900000) * 900000
+  }
+  property double clockMs: Date.now()
+  readonly property double nowMs: clockMs + placeShiftMs
+  function tick() { view.clockMs = Date.now() }
 
   readonly property var nextEvent: payload ? payload.next_event : null
   readonly property real riseMs: payload ? Model.parseIsoLocal(payload.sunrise) : NaN
   readonly property real setMs: payload ? Model.parseIsoLocal(payload.sunset) : NaN
-  readonly property real elevNow: payload ? Model.num(payload.elevation_deg, NaN) : NaN
+  // The payload's reading is as old as the fetch; the model's moves
+  // with the clock.
+  readonly property real elevNow: {
+    if (!payload) return NaN
+    var modeled = elevationAt(nowMs)
+    return isNaN(modeled) ? Model.num(payload.elevation_deg, NaN) : modeled
+  }
+  readonly property string polar: payload && payload.polar ? String(payload.polar) : ""
+  // The day in a tradition's hours (`linecast hours`): prayer times,
+  // zmanim, the Roman or Japanese hours. Null with none set.
+  readonly property var hours: payload && payload.hours ? payload.hours : null
+  readonly property var hourMarks: hours && hours.marks ? hours.marks : []
+  readonly property int nextMarkIndex: {
+    for (var i = 0; i < hourMarks.length; i++)
+      if (Model.parseIsoLocal(hourMarks[i].time) > nowMs) return i
+    return -1
+  }
   readonly property bool sunUp: !isNaN(elevNow) && elevNow > -0.833
 
   // Scrubbing: hovering the arc moves the sun and repaints the sky for
@@ -46,55 +76,23 @@ Item {
   readonly property real focusElev: scrubbing ? elevationAt(scrubMs) : elevNow
   onScrubMsChanged: arc.requestPaint()
 
-  // ---- A solar model for any moment of the day. Latitude isn't in the
-  //      payload, so it's recovered from the day's length and the date
-  //      (day length at a given declination pins the latitude, sign
-  //      included), and elevation follows from the hour angle around
-  //      solar noon.
+  // ---- A solar model for any moment of the day (Model.js): the place
+  //      isn't in the payload, so its latitude is recovered from the
+  //      day's length and the sun's height at the fetch, and elevation
+  //      follows from the hour angle around solar noon.
   readonly property real solarNoonMs: payload ? Model.parseIsoLocal(payload.solar_noon) : NaN
-  readonly property real declinationDeg: {
-    if (isNaN(view.solarNoonMs)) return 0
-    var d = new Date(view.solarNoonMs)
-    var start = new Date(d.getFullYear(), 0, 0)
-    var doy = Math.floor((d.getTime() - start.getTime()) / 86400000)
-    return 23.44 * Math.sin(2 * Math.PI * (doy - 81) / 365)
-  }
+  readonly property real declinationDeg: isNaN(solarNoonMs) ? 0 : Model.solarDeclination(solarNoonMs)
   readonly property real latitudeDeg: {
-    if (!view.payload || view.payload.day_length_seconds === null) return 45
-    var hours = Model.num(view.payload.day_length_seconds, NaN) / 3600
-    if (isNaN(hours)) return 45
-    var rad = Math.PI / 180
-    var dec = view.declinationDeg * rad
-    var h0 = Math.sin(-0.833 * rad)
-    if (Math.abs(view.declinationDeg) < 0.4 || Math.abs(hours - 12) < 0.05) return 45
-    // Day longer than 12h under a northern-summer sun means north, and
-    // so on; then bisect |lat| until the modeled day matches.
-    var north = (hours > 12) === (view.declinationDeg > 0)
-    function dayLength(latAbs) {
-      var lat = (north ? latAbs : -latAbs) * rad
-      var c = (h0 - Math.sin(lat) * Math.sin(dec)) / (Math.cos(lat) * Math.cos(dec))
-      if (c <= -1) return 24
-      if (c >= 1) return 0
-      return 2 * Math.acos(c) / rad / 15
-    }
-    var lo = 0, hi = 89.5
-    var grows = dayLength(hi) > dayLength(lo)
-    for (var i = 0; i < 40; i++) {
-      var mid = (lo + hi) / 2
-      if ((dayLength(mid) < hours) === grows) lo = mid
-      else hi = mid
-    }
-    var latAbs = (lo + hi) / 2
-    return north ? latAbs : -latAbs
+    if (!view.payload || isNaN(view.solarNoonMs)) return 45
+    return Model.solarLatitude(view.declinationDeg,
+                               Model.num(view.payload.day_length_seconds, NaN) / 3600,
+                               view.solarNoonMs,
+                               Model.parseIsoLocal(view.payload.fetched_at),
+                               Model.num(view.payload.elevation_deg, NaN))
   }
   function elevationAt(ms) {
     if (isNaN(view.solarNoonMs)) return NaN
-    var rad = Math.PI / 180
-    var lat = view.latitudeDeg * rad
-    var dec = view.declinationDeg * rad
-    var hourAngle = 15 * (ms - view.solarNoonMs) / 3600000 * rad
-    var sinAlt = Math.sin(lat) * Math.sin(dec) + Math.cos(lat) * Math.cos(dec) * Math.cos(hourAngle)
-    return Math.asin(Math.max(-1, Math.min(1, sinAlt))) / rad
+    return Model.solarElevation(view.latitudeDeg, view.declinationDeg, view.solarNoonMs, ms)
   }
   function twilightWord(elev) {
     if (isNaN(elev)) return ""
@@ -108,12 +106,12 @@ Item {
   function refresh() { feed.refresh() }
 
   function startOfDay() {
-    var d = new Date(isNaN(view.riseMs) ? view.nowMs : view.riseMs)
+    var d = new Date(isNaN(view.solarNoonMs) ? view.nowMs : view.solarNoonMs)
     d.setHours(0, 0, 0, 0)
     return d.getTime()
   }
 
-  onShownChanged: if (shown) { view.nowMs = Date.now(); feed.refreshIfStale() }
+  onShownChanged: if (shown) { view.tick(); feed.refreshIfStale() }
   // The canvas reads its colors imperatively in onPaint; a theme swap
   // needs an explicit repaint.
   onForegroundChanged: arc.requestPaint()
@@ -138,7 +136,7 @@ Item {
     running: view.shown
     repeat: true
     onTriggered: {
-      view.nowMs = Date.now()
+      view.tick()
       arc.requestPaint()
     }
   }
@@ -155,7 +153,7 @@ Item {
       horizontalAlignment: Text.AlignHCenter
       topPadding: Style.space(24)
       bottomPadding: Style.space(24)
-      text: feed.fetching ? "Reading the sky…" : "No solar data — is linecast ≥ 1.9 installed?"
+      text: feed.fetching ? "Reading the sky…" : "No solar data — linecast couldn't be read."
       wrapMode: Text.WordWrap
       color: view.muted
       font.family: view.fontFamily
@@ -164,13 +162,17 @@ Item {
 
     // ---- Header, battery-panel style: the next event as the status
     //      line, the countdown as the reading.
+    //      Past the polar circles there may be no event to count to.
     FaceHeader {
-      visible: !!view.nextEvent
-      icon: view.nextEvent && view.nextEvent.kind === "sunrise" ? "󰖜" : "󰖛"
+      visible: !!view.payload
+      icon: view.nextEvent ? (view.nextEvent.kind === "sunrise" ? "󰖜" : "󰖛")
+        : view.polar === "night" ? "󰖔" : "󰖙"
       title: "Sunshine"
       subtitle: view.nextEvent
-        ? ("until " + view.nextEvent.kind + " at " + Model.clockLabel(view.nextEvent.time))
-        : ""
+        ? ("until " + view.nextEvent.kind + " at " + Model.clockLabel(view.nextEvent.time)
+           + (Model.dayTag(view.nextEvent.time, view.nowMs) === "" ? "" : " " + Model.dayTag(view.nextEvent.time, view.nowMs)))
+        : view.polar === "day" ? "polar day — the sun stays up"
+        : view.polar === "night" ? "polar night — the sun stays down" : ""
       bigValue: {
         if (!view.nextEvent) return ""
         var secs = Model.secondsUntil(view.nextEvent.time, view.nowMs)
@@ -180,41 +182,36 @@ Item {
       fontFamily: view.fontFamily
     }
 
-    // ---- The arc: today from midnight to midnight, elevation as a sine
-    //      bulge between rise and set and a shallower dip at night, under
-    //      a sky painted for the sun's elevation right now.
+    // ---- The arc: today from midnight to midnight, the sun's height
+    //      above and below the horizon on the TUI's seasonal scale (the
+    //      summer solstice's noon at the top, the winter solstice's
+    //      midnight at the bottom), under a sky painted for the sun's
+    //      elevation right now.
     Canvas {
       id: arc
-      visible: !!(view.payload && !isNaN(view.riseMs) && !isNaN(view.setMs))
+      visible: !!view.payload && !isNaN(view.solarNoonMs)
       width: parent.width
-      height: Style.space(132)
+      height: Style.space(148)
 
       onPaint: {
         var ctx = getContext("2d")
         ctx.clearRect(0, 0, width, height)
-        if (!view.payload || isNaN(view.riseMs) || isNaN(view.setMs)) return
+        if (!view.payload || isNaN(view.solarNoonMs)) return
 
         var w = width
         var h = height
-        var horizonY = Math.round(h * 0.64)
-        var dayAmp = h * 0.52
-        var nightAmp = h * 0.26
-
-        var rise = view.riseMs
-        var set = view.setMs
         var t0 = view.startOfDay()
         var t1 = t0 + 24 * 3600 * 1000
         var now = view.nowMs
 
-        function elev(t) {
-          if (t >= rise && t <= set)
-            return Math.sin(Math.PI * (t - rise) / (set - rise)) * dayAmp
-          var night = (rise - t0) + (t1 - set)
-          if (t < rise) return -Math.sin(Math.PI * (rise - t) / night) * nightAmp
-          return -Math.sin(Math.PI * (t - set) / night) * nightAmp
-        }
+        // One scale above and below, so the curve crosses the horizon
+        // without a bend; the margin keeps the solstice sun inside.
+        var horizonY = Math.round(h / 2)
+        var margin = 11
+        var perDegree = (horizonY - margin) / Model.solarAnnualPeak(view.latitudeDeg)
+
         function xFor(t) { return (t - t0) / (t1 - t0) * w }
-        function yFor(t) { return horizonY - elev(t) }
+        function yFor(t) { return horizonY - view.elevationAt(t) * perDegree }
 
         var focus = Math.max(t0, Math.min(t1, view.focusMs))
         var sunX = xFor(focus)
@@ -237,12 +234,13 @@ Item {
           ctx.fillRect(x, 0, Math.min(step, w - x), horizonY)
         }
 
-        // Glow around the sun, reaching a little below the horizon at
-        // dusk and dawn; nothing once it's properly night.
+        // Glow around the sun; below the horizon it stays on the
+        // horizon, where the light is. Nothing once it's properly night.
         if (e > -12) {
           var sunC = e > -0.833 ? view.sky.sun : view.sky.sunTwilight
           var strength = Math.max(0, Math.min(1, (e + 12) / 14))
-          var glow = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, h * 0.55)
+          var glowY = Math.min(sunY, horizonY)
+          var glow = ctx.createRadialGradient(sunX, glowY, 0, sunX, glowY, h * 0.5)
           glow.addColorStop(0, Model.cssRgba(sunC, 0.55 * strength))
           glow.addColorStop(0.35, Model.cssRgba(sunC, 0.18 * strength))
           glow.addColorStop(1, Model.cssRgba(sunC, 0))
@@ -255,31 +253,47 @@ Item {
           ctx.restore()
         }
 
-        // The horizon.
-        ctx.strokeStyle = Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.22)
+        // The horizon, ticked where the tradition's hours fall.
+        var ink = view.foreground
+        ctx.strokeStyle = Qt.rgba(ink.r, ink.g, ink.b, 0.22)
         ctx.lineWidth = 1
         ctx.beginPath()
         ctx.moveTo(0, horizonY + 0.5)
         ctx.lineTo(w, horizonY + 0.5)
         ctx.stroke()
+        ctx.strokeStyle = Qt.rgba(ink.r, ink.g, ink.b, 0.5)
+        for (var m = 0; m < view.hourMarks.length; m++) {
+          var markMs = Model.parseIsoLocal(view.hourMarks[m].time)
+          if (isNaN(markMs) || markMs < t0 || markMs > t1) continue
+          var markX = Math.round(xFor(markMs)) + 0.5
+          ctx.beginPath()
+          ctx.moveTo(markX, horizonY + 1)
+          ctx.lineTo(markX, horizonY + 6)
+          ctx.stroke()
+        }
 
-        // The arc: dim below the horizon, brighter across the sky.
-        function strokeSpan(from, to, color) {
+        // The arc, one line through the whole day: brighter across the
+        // sky, dim below the horizon.
+        function strokeArc(top, bottom, color) {
+          ctx.save()
+          ctx.beginPath()
+          ctx.rect(0, top, w, bottom - top)
+          ctx.clip()
           ctx.strokeStyle = color
           ctx.lineWidth = 2
-          ctx.lineCap = "round"
+          ctx.lineJoin = "round"
           ctx.beginPath()
-          var steps = 80
+          var steps = Math.max(48, Math.round(w / 2))
           for (var i = 0; i <= steps; i++) {
-            var t = from + (to - from) * i / steps
+            var t = t0 + (t1 - t0) * i / steps
             if (i === 0) ctx.moveTo(xFor(t), yFor(t))
             else ctx.lineTo(xFor(t), yFor(t))
           }
           ctx.stroke()
+          ctx.restore()
         }
-        strokeSpan(t0, rise, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
-        strokeSpan(set, t1, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
-        strokeSpan(rise, set, Qt.rgba(view.foreground.r, view.foreground.g, view.foreground.b, 0.75))
+        strokeArc(horizonY, h, Qt.rgba(view.muted.r, view.muted.g, view.muted.b, 0.9))
+        strokeArc(0, horizonY, Qt.rgba(ink.r, ink.g, ink.b, 0.75))
 
         // While scrubbing, a small mark keeps now on the arc.
         if (view.scrubbing && now >= t0 && now <= t1) {
@@ -385,6 +399,7 @@ Item {
       Text {
         textFormat: Text.PlainText
         anchors.left: parent.left
+        visible: !!(view.payload && view.payload.sunrise)
         text: "󰖜 " + Model.clockLabel(view.payload ? view.payload.sunrise : "")
         color: view.foreground
         font.family: view.fontFamily
@@ -398,7 +413,9 @@ Item {
 
         Text {
           textFormat: Text.PlainText
-          text: view.payload && view.payload.day_length_seconds !== null
+          text: view.polar === "night" ? "no daylight"
+            : view.polar === "day" ? "24h of daylight"
+            : view.payload && view.payload.day_length_seconds !== null
             ? Model.fmtDuration(view.payload.day_length_seconds) : ""
           color: view.foreground
           font.family: view.fontFamily
@@ -418,6 +435,7 @@ Item {
       Text {
         textFormat: Text.PlainText
         anchors.right: parent.right
+        visible: !!(view.payload && view.payload.sunset)
         text: Model.clockLabel(view.payload ? view.payload.sunset : "") + " 󰖛"
         color: view.foreground
         font.family: view.fontFamily
@@ -468,6 +486,70 @@ Item {
         InfoPair {
           label: "Sunset tmrw"
           value: view.payload ? Model.clockLabel(view.payload.tomorrow_sunset) : ""
+          foreground: view.foreground
+          fontFamily: view.fontFamily
+        }
+      }
+    }
+
+    // ---- The day in a tradition's hours, when `linecast hours` names
+    //      one: what the hour is now, the next mark, then every mark.
+    PanelSeparator { visible: view.hourMarks.length > 0; foreground: view.foreground }
+
+    Item {
+      visible: view.hourMarks.length > 0
+      width: parent.width
+      height: hoursTitle.implicitHeight
+
+      Text {
+        id: hoursTitle
+        textFormat: Text.PlainText
+        anchors.left: parent.left
+        width: parent.width - hoursNext.implicitWidth - Style.space(12)
+        elide: Text.ElideRight
+        text: {
+          if (!view.hours) return ""
+          if (view.hours.now && view.hours.now.label) return String(view.hours.now.label)
+          var name = String(view.hours.system || "")
+          name = name.charAt(0).toUpperCase() + name.slice(1) + " hours"
+          return view.hours.variant_name ? name + " · " + view.hours.variant_name : name
+        }
+        color: view.foreground
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        id: hoursNext
+        textFormat: Text.PlainText
+        anchors.right: parent.right
+        anchors.baseline: hoursTitle.baseline
+        text: {
+          var next = view.nextMarkIndex >= 0 ? view.hourMarks[view.nextMarkIndex] : null
+          if (!next) return ""
+          var secs = Model.secondsUntil(next.time, view.nowMs)
+          return isNaN(secs) ? "" : next.name + " in " + Model.fmtDuration(Math.max(0, secs))
+        }
+        color: view.muted
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+    }
+
+    Grid {
+      visible: view.hourMarks.length > 0
+      width: parent.width
+      columns: 2
+      columnSpacing: Style.space(16)
+      rowSpacing: Style.space(4)
+
+      Repeater {
+        model: view.hourMarks
+
+        InfoPair {
+          width: (parent.width - Style.space(16)) / 2
+          label: (index === view.nextMarkIndex ? "▸ " : "") + String(modelData.name || modelData.key || "")
+          value: Model.clockLabel(modelData.time)
           foreground: view.foreground
           fontFamily: view.fontFamily
         }

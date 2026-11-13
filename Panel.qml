@@ -79,7 +79,7 @@ Panel {
     : settings && settings.temperature === "fahrenheit" ? " --fahrenheit" : ""
 
   // Float one of linecast's views in a terminal: weather, sunshine, moon,
-  // tides, radar, or maps.
+  // tides, sky, radar, or maps.
   function launch(name) {
     if (root.bar) root.bar.run("LINECAST_TEMP='" + root.tempFlag.trim() + "' " + root.pluginDir + "scripts/linecast-toggle.sh " + name)
   }

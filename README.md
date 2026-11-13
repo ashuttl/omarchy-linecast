@@ -2,7 +2,7 @@
 
 An [Omarchy](https://omarchy.org) bar-widget plugin built on
 [linecast](https://github.com/ashuttl/linecast) — weather, the sun, the
-moon, the tides, radar, and maps, drawn for the terminal. The bar gets a
+moon, the tides, the sky, radar, and maps, drawn for the terminal. The bar gets a
 pill for each of the first four; every pill opens a panel that matches the
 stock ones and re-inks itself when you switch themes. linecast itself
 comes bundled, so there is nothing else to install.
@@ -19,22 +19,27 @@ comes bundled, so there is nothing else to install.
   Right click opens the matching linecast view in a floating terminal.
   `r` refetches, `Escape` closes, `Tab` moves to the neighboring bar
   panels.
-- **Weather panel**: current conditions with a plain-English comparison
-  to yesterday, weather alerts, a scrollable hourly temperature line and a
+- **Weather panel**: current conditions with linecast's forecast in
+  plain English, weather alerts, a scrollable hourly temperature line and a
   week of range bars in linecast's temperature colors, and wind, humidity,
-  sun times, and air quality at a glance. Click the place name to change
+  sun times, air quality, and how today compares with the ten-year
+  average at a glance. Click the place name to change
   location.
-- **Sunshine panel**: the day's solar arc under a sky that follows the
-  hour, the sun at its current position, with sunrise, sunset, day length
-  and its day-to-day drift.
+- **Sunshine panel**: the sun's height through the day, drawn on
+  linecast's seasonal scale so the arc rides high in summer and low in
+  winter, under a sky that follows the hour, with sunrise, sunset, day
+  length and its day-to-day drift. Hover the arc to scrub the day. Polar
+  day and polar night are drawn as they are, and if `linecast hours` is
+  set (prayer times, zmanim, the Roman or Japanese hours), the day's
+  marks are ticked on the horizon and listed underneath.
 - **Moon panel**: a drawn phase disc (correct terminator, hemisphere
   aware), phase and illumination, moonrise and moonset, the next full and
   new moons.
 - **Tides panel**: the tide curve for the day with the water marked at
   now, the turns labeled, the next high or low, and the station name.
-- **Radar and Maps**, one click from the weather panel: linecast's live
-  precipitation radar and its terrain, street, and globe maps open in a
-  floating terminal.
+- **Radar, Maps, and Sky**, one click from the weather panel: linecast's
+  live precipitation radar, its terrain, street, and globe maps, and the
+  stars and planets overhead open in a floating terminal.
 
 Everything is colored from the current Omarchy theme, and so is
 linecast itself, so the bar, the panels, and the terminal views all
