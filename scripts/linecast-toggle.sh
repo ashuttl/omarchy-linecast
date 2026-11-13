@@ -1,14 +1,14 @@
 #!/bin/bash
 # Float a linecast view in its own terminal window: open if absent, close
 # if present. Usage: linecast-toggle.sh <name>
-# (weather, sunshine, moon, tides, radar, maps)
+# (weather, sunshine, moon, tides, sky, radar, maps)
 
 name="$1"
 class="org.omarchy.linecast-$name"
 linecast="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/linecast"
 
 case "$name" in
-  radar | maps) size="1280 820" ;;
+  radar | maps | sky) size="1280 820" ;;
   tides) size="1100 680" ;;
   *) size="1000 640" ;;
 esac

@@ -324,6 +324,24 @@ function windArrow(directionDeg) {
   return WIND_ARROWS.charAt(Math.round(((d % 360) + 360) % 360 / 45) % 8)
 }
 
+// "48° / 34°": the ten-year average high and low around this date.
+function averageLine(hist) {
+  if (!hist || isNaN(num(hist.avg_high, NaN)) || isNaN(num(hist.avg_low, NaN))) return ""
+  return roundTemp(hist.avg_high) + " / " + roundTemp(hist.avg_low)
+}
+
+// Today's high against the average, as the TUI's dashboard says it:
+// "2° below avg", or "near avg" inside its threshold (smaller in °C).
+function averageComparison(high, hist, tempUnit) {
+  var h = num(high, NaN)
+  var avg = hist ? num(hist.avg_high, NaN) : NaN
+  if (isNaN(h) || isNaN(avg)) return ""
+  var diff = h - avg
+  var threshold = String(tempUnit || "").indexOf("C") >= 0 ? 1.5 : 2.5
+  if (Math.abs(diff) < threshold) return "near avg"
+  return Math.round(Math.abs(diff)) + "° " + (diff > 0 ? "above" : "below") + " avg"
+}
+
 // Wind significance threshold, matching the TUI (15 mph / 25 km/h).
 function windSignificant(speed, windUnit) {
   var v = num(speed, 0)
@@ -442,6 +460,89 @@ function skyColorAt(stops, elev) {
     }
   }
   return stops[stops.length - 1][1]
+}
+
+// ---- A solar model for the sunshine arc. `linecast sunshine --json`
+// gives the day's times and the sun's height at one moment, not the
+// place, so the latitude is recovered from those and the curve follows
+// from it: the same hour-angle arithmetic the TUI plots its arc with.
+
+var RAD = Math.PI / 180
+
+// The sun's declination in degrees at an epoch-ms moment (low-precision
+// ephemeris, good to a hundredth of a degree).
+function solarDeclination(ms) {
+  var n = ms / 86400000 - 10957.5
+  var g = (357.528 + 0.9856003 * n) * RAD
+  var lambda = (280.460 + 0.9856474 * n + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * RAD
+  return Math.asin(Math.sin(23.439 * RAD) * Math.sin(lambda)) / RAD
+}
+
+// Elevation in degrees at `ms`, for a latitude, declination, and the
+// moment of solar noon.
+function solarElevation(latDeg, decDeg, noonMs, ms) {
+  var lat = latDeg * RAD
+  var dec = decDeg * RAD
+  var hourAngle = 15 * (ms - noonMs) / 3600000 * RAD
+  var sinAlt = Math.sin(lat) * Math.sin(dec) + Math.cos(lat) * Math.cos(dec) * Math.cos(hourAngle)
+  return Math.asin(Math.max(-1, Math.min(1, sinAlt))) / RAD
+}
+
+// Hours between the upper limb's rise and set; 0 or 24 past the polar circles.
+function solarDayHours(latDeg, decDeg) {
+  var lat = latDeg * RAD
+  var dec = decDeg * RAD
+  var c = (Math.sin(-0.833 * RAD) - Math.sin(lat) * Math.sin(dec)) / (Math.cos(lat) * Math.cos(dec))
+  if (c <= -1) return 24
+  if (c >= 1) return 0
+  return 2 * Math.acos(c) / RAD / 15
+}
+
+// Latitude from what the payload does carry. The day's length pins it,
+// sign included, except near an equinox (every latitude has a twelve-hour
+// day) and past the polar circles (every latitude has none, or all of
+// it); there the sun's height at the fetch does, read against the hour
+// angle, with the day's length choosing between the two answers.
+function solarLatitude(decDeg, dayHours, noonMs, sampleMs, sampleElevDeg) {
+  var polar = isNaN(dayHours) || dayHours < 0.05 || dayHours > 23.95
+  if (!polar && Math.abs(decDeg) >= 2 && Math.abs(dayHours - 12) >= 0.1) {
+    var north = (dayHours > 12) === (decDeg > 0)
+    var lo = 0, hi = 89.5
+    for (var i = 0; i < 40; i++) {
+      var mid = (lo + hi) / 2
+      // Away from the equator the day stretches in summer, shrinks in winter.
+      if ((solarDayHours(north ? mid : -mid, decDeg) < dayHours) === (dayHours > 12)) lo = mid
+      else hi = mid
+    }
+    return north ? (lo + hi) / 2 : -(lo + hi) / 2
+  }
+  if (!isNaN(sampleElevDeg) && !isNaN(sampleMs) && !isNaN(noonMs)) {
+    var a = Math.sin(decDeg * RAD)
+    var b = Math.cos(decDeg * RAD) * Math.cos(15 * (sampleMs - noonMs) / 3600000 * RAD)
+    var r = Math.sqrt(a * a + b * b)
+    if (r > 0.05) {
+      var base = Math.atan2(a, b) / RAD
+      var spread = Math.acos(Math.max(-1, Math.min(1, Math.sin(sampleElevDeg * RAD) / r))) / RAD
+      var best = NaN, bestErr = Infinity
+      var candidates = [base + spread, base - spread]
+      for (var k = 0; k < 2; k++) {
+        var lat = candidates[k] - 360 * Math.round(candidates[k] / 360)
+        if (lat > 90 || lat < -90) continue
+        var err = isNaN(dayHours) ? 0 : Math.abs(solarDayHours(lat, decDeg) - dayHours)
+        if (err < bestErr) { bestErr = err; best = lat }
+      }
+      if (!isNaN(best)) return best
+    }
+  }
+  if (polar && !isNaN(dayHours)) return ((dayHours > 12) === (decDeg > 0)) ? 80 : -80
+  return 45
+}
+
+// The TUI's vertical scale: the sun's height at noon on the summer
+// solstice, which the winter solstice's midnight mirrors below the
+// horizon, so the arc rides high in June and low in December.
+function solarAnnualPeak(latDeg) {
+  return Math.max(5, 90 - Math.abs(Math.abs(latDeg) - 23.44))
 }
 
 function cssRgba(c, a) {
