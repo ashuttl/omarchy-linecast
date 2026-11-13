@@ -1,0 +1,852 @@
+"""Right-to-left text on a terminal: the output pass that puts each row
+in display order.
+
+Strings stay in logical order everywhere in linecast, first letter
+first, and the views lay a frame out in columns from them.  Most
+terminals draw cells exactly as they are sent: they neither reorder
+right-to-left text nor join Arabic letters, so a Persian or Hebrew word
+sent as it is stored comes out backwards, and Arabic-script letters
+each in their isolated form.  The terminals that do reorder (VTE, and
+Konsole) do it per line, treating a whole row as one paragraph, which
+scrambles a row that holds a graph, a column of numbers, and a label.
+So linecast does the work itself, as Egmont Koblinger's "BiDi in
+Terminal Emulators" recommends for full-screen programs: it reorders
+and shapes each row here, and asks the terminal to draw cells as sent
+(explicit mode, CSI 8 l; see TERMINAL_EXPLICIT).
+
+A row goes through these steps, all of them skipped for a row with no
+right-to-left character and no bidi control, which is almost every row
+of a map or a radar frame:
+
+1. The row is split into cells -- a character with the marks and
+   joiners that ride on it -- each carrying the SGR state it was drawn
+   in.
+2. Arabic-script letters are shaped (terminal/shaping.py): each becomes
+   its initial, medial, final or isolated presentation form by whether
+   its neighbours join it.  The forms come from unicodedata alone
+   (every presentation form decomposes as <initial>, <medial>, <final>
+   or <isolated> of its letter), so there is no table to keep.  لا
+   stays two cells, lam and alef, rather than the one-glyph ligature: a
+   frame is laid out in cells before this pass runs, and the pass may
+   move cells but never add or remove one.
+3. The row is cut into segments: stretches of text between graphics
+   (block elements, braille, box drawing, the icon fonts' private use
+   area) and gaps of two or more spaces.  Each segment is its own
+   paragraph, so two place names over the sea keep their places, and a
+   graph between two labels never reverses.  A segment reads right to
+   left if the interface language does and it holds right-to-left
+   text, else by its first strong character, as an HTML dir="auto"
+   element does.  A view can say more with Unicode isolates (RLI, LRI,
+   FSI ... PDI), which take no cells and which this pass removes.
+4. Each segment is ordered by the Unicode Bidirectional Algorithm
+   (UAX #9, in terminal/uba.py, checked against Unicode's
+   BidiCharacterTest.txt), and brackets and other mirrored characters
+   in right-to-left runs are drawn mirrored.
+5. Digits are written in the reader's digit set (Persian ۰-۹), except
+   inside an LRI isolate, which is how a view marks an identifier.
+6. The cells go out in display order, each in its own SGR state.
+"""
+
+import os
+import re
+import unicodedata
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Explicit mode: the terminal draws cells in the order they are sent and
+# leaves shaping to the program (Koblinger's BDSM, reset).  A terminal
+# that does not know the mode ignores it, as it does any unknown mode.
+TERMINAL_EXPLICIT = "\033[8l"
+TERMINAL_IMPLICIT = "\033[8h"
+
+# A language's own digits are its "digits" setting.  Persian and Urdu
+# write the extended Arabic-Indic digits, U+06F0-06F9; the decimal
+# separator is U+066B and the percent sign U+066A.
+_DECIMAL_MARK = "٫"
+_PERCENT_SIGN = "٪"
+
+_ui_rtl = False
+_digits = None        # the digits to write, or None to leave them be
+_to_latin = False     # write native digits back as ASCII (digits: latin)
+_reorder = True       # False: the text goes out as the views wrote it
+_visual = True        # True: in display order; False: in isolates for the terminal
+_mirror_request = False
+
+
+# The settings' spellings, as `linecast digits` and LINECAST_DIGITS take
+# them: "native" is the language's own digits where it has them,
+# "latin" 0-9 in every language.
+def resolve_digits(lang, environ=None):
+    """(choice, source) for *lang*: "native" or "latin", and
+    "LINECAST_DIGITS", "config", or "auto".
+
+    Precedence: LINECAST_DIGITS > the `digits` key in config.json
+    (`linecast digits latin|native`) > the language's own digits where
+    it has them, which is Persian today.  Never raises: a config that
+    cannot be read counts as no saved setting."""
+    try:
+        from linecast._config import chosen
+        choice, source = chosen("digits", environ)
+    except Exception:
+        choice = None
+    if choice:
+        return choice, source
+    from linecast._i18n import setting
+    native = setting(lang or "en", "digits") is not None
+    return ("native" if native else "latin"), "auto"
+
+
+def configure(lang="en", environ=None):
+    """Set the pass up for the interface language `lang`.
+
+    LINECAST_BIDI=terminal leaves the text in logical order for a
+    terminal that reorders and shapes by itself and cannot be told not
+    to; LINECAST_DIGITS=latin, or `linecast digits latin`, keeps ASCII
+    digits in a language that has its own."""
+    global _ui_rtl, _digits, _to_latin, _reorder, _visual
+    from linecast._i18n import base_language, is_rtl, setting
+    env = os.environ if environ is None else environ
+    lang = base_language(lang or "en")
+    _ui_rtl = is_rtl(lang)
+    choice, source = resolve_digits(lang, env)
+    native = setting(lang, "digits")
+    # Only a latin that was asked for writes other scripts' digits back
+    # as ASCII; auto in a language without its own leaves them be.
+    _to_latin = choice == "latin" and source != "auto"
+    _digits = None if (_to_latin or native is None) else native
+    mode = bidi_mode(env)
+    _reorder = mode != "off"
+    _visual = mode == "linecast"
+
+
+def bidi_mode(environ=None):
+    """Who puts right-to-left text in order.
+
+    "linecast" (the default): this pass, which sends each row in display
+    order and asks the terminal to draw it as sent.  "terminal": the
+    terminal, for one that orders text itself and cannot be told not
+    to; this pass still lays the row out, and hands each piece of
+    right-to-left text over in logical order inside an isolate, so the
+    terminal orders it where it stands and cannot move it across the
+    row.  "off": the text goes out as the views wrote it."""
+    env = os.environ if environ is None else environ
+    value = str(env.get("LINECAST_BIDI", "")).strip().lower()
+    if value in ("linecast", "terminal"):
+        return value
+    if value in ("off", "0", "no", "false"):
+        return "off"
+    return "terminal" if orders_text_itself(env) else "linecast"
+
+
+# Terminals known to order right-to-left text themselves and to ignore
+# the request not to (CSI 8 l): the name each gives for itself when asked
+# (XTVERSION), and the variable it sets in its sessions.  There is no
+# query for the behaviour itself: neither Konsole nor foot, which does
+# not order text, answers the mode request for BDSM, and cursor reports
+# are logical.  Nor do marks around display-ordered text serve both: in
+# Konsole LRM or LRO keeps the order but the letters are reshaped wrongly,
+# and Alacritty draws the marks; Konsole also drops a zero-width character
+# sent at column 1.  So a terminal is recognized by name.
+# Each entry: the name, the variable, and the value it must have (None
+# for any).  Apple's Terminal gives no name when asked, and orders each
+# line itself; it also draws whatever follows a run of right-to-left text
+# too far right, n - 1 columns for a run of n cells and one for each
+# zero-width mark on the line, with the backgrounds left in place.  A run
+# there is what Terminal's own algorithm reverses, so a space or a block
+# between two right-to-left words joins them.  Its words read right in
+# the isolates; that drift stays.  A correction was sketched and set
+# aside as too much for one terminal: send each word reversed for
+# Terminal to turn back, part the runs with LRM, and move the glyphs left
+# over the blanks that follow while each cell keeps its background.
+# iTerm2 (3.7) reverses the words this pass has ordered too, with the
+# layout intact, and is not in the table: it has an advanced setting for
+# bidi on the alternate screen (alternateScreenBidi) that is untried.
+_ORDERS_TEXT_ITSELF = (
+    ("Konsole", "KONSOLE_VERSION", None),
+    ("Terminal.app", "TERM_PROGRAM", "Apple_Terminal"),
+)
+# The ones among them that draw right-to-left text out of place, which
+# doctor says plainly
+MISPLACES_TEXT = ("Terminal.app",)
+# Multiplexers answer XTVERSION themselves; the terminal around them is
+# the one that draws, known only by the variables it left behind.
+_MULTIPLEXERS = ("tmux", "screen", "zellij")
+
+
+def orders_text_itself(environ=None):
+    """The name of the terminal on screen when it is one known to order
+    right-to-left text itself, else None.  The name it gives when asked
+    decides; the variables it sets are asked only when it has not said,
+    or a multiplexer answered for it, since a terminal started from a
+    Konsole shell inherits KONSOLE_VERSION without being Konsole."""
+    from linecast.terminal import term as _term
+    env = os.environ if environ is None else environ
+    said = (_term.terminal_name or "").lower()
+    for name, _variable, _value in _ORDERS_TEXT_ITSELF:
+        if said.startswith(name.lower()):
+            return name
+    if said and not said.startswith(_MULTIPLEXERS):
+        return None
+    for name, variable, value in _ORDERS_TEXT_ITSELF:
+        have = env.get(variable)
+        if have and (value is None or have == value):
+            return name
+    return None
+
+
+def refresh_mode(environ=None):
+    """Choose the mode again, once the terminal has said who it is."""
+    global _reorder, _visual
+    mode = bidi_mode(os.environ if environ is None else environ)
+    _reorder = mode != "off"
+    _visual = mode == "linecast"
+
+
+def set_mirror(on):
+    """Whether the view on screen lays out from the right in a
+    right-to-left language: a view calls this as it renders, True for
+    its text and its charts whose axis is time, False for a picture of
+    the world (a map, the sky, the Moon's disc), whose east stays east."""
+    global _mirror_request
+    _mirror_request = bool(on)
+
+
+def mirrored():
+    """Whether rows go out mirrored: the view asked, the interface reads
+    right to left, and this pass is ordering the text."""
+    return _mirror_request and _ui_rtl and _reorder
+
+
+def reorders():
+    """Whether this pass puts rows in display order (and explicit mode
+    should be asked of the terminal)."""
+    return _reorder and _visual
+
+
+def active():
+    """Whether display() can change anything at all."""
+    return _reorder or _digits is not None or _to_latin
+
+
+# ---------------------------------------------------------------------------
+# Marking text
+# ---------------------------------------------------------------------------
+LRI, RLI, FSI, PDI = "\u2066", "\u2067", "\u2068", "\u2069"
+
+
+def isolate(text, direction="auto"):
+    """`text` as its own paragraph: "rtl", "ltr", or "auto" (by its
+    first strong character).  The isolate characters take no cells."""
+    if not text:
+        return text
+    mark = {"rtl": RLI, "ltr": LRI}.get(direction, FSI)
+    return f"{mark}{text}{PDI}"
+
+
+def identifier(text):
+    """Text that keeps its own order and its ASCII digits in any
+    language: a version, a station id, a key, a URL."""
+    return isolate(text, "ltr") if text else text
+
+
+def picture(text):
+    """A picture of the world inside a mirrored view -- a Moon in the
+    month grid -- kept as drawn: not reversed, not flipped.  Unchanged
+    when nothing is mirrored."""
+    return isolate(text, "ltr") if text and mirrored() else text
+
+
+# ---------------------------------------------------------------------------
+# Character data
+# ---------------------------------------------------------------------------
+
+# Everything the pass has to look at a row for: the right-to-left
+# blocks (Hebrew through Arabic Extended, the presentation forms, and
+# the historic scripts of the SMP) and the bidi controls.
+_RTL_OR_CONTROL = re.compile(
+    "[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufeff\U00010800-\U00010fff"
+    "\U0001e800-\U0001efff\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+
+
+def _build_picture_mirror():
+    """Each glyph a mirrored row draws flipped left for right: box
+    drawing, block elements and triangles, the legacy computing blocks,
+    found by trading LEFT for RIGHT in the character's name;
+    braille, by trading the dot columns."""
+    table = {}
+    # Not the arrows: a wind arrow points at the world, not along the row
+    ranges = ((0x2500, 0x25FF), (0x1FB00, 0x1FBFF))
+    for lo, hi in ranges:
+        for o in range(lo, hi + 1):
+            ch = chr(o)
+            name = unicodedata.name(ch, "")
+            if "LEFT" not in name and "RIGHT" not in name:
+                continue
+            other = re.sub("LEFT|RIGHT",
+                           lambda m: "RIGHT" if m.group() == "LEFT" else "LEFT", name)
+            try:
+                table[ch] = unicodedata.lookup(other)
+            except KeyError:
+                pass
+    # The quadrants whose names list three corners in a fixed order
+    for a, b in ("▙▟", "▛▜", "▚▞"):
+        table[a], table[b] = b, a
+    for bits in range(256):
+        left = bits & 0x07 | (bits & 0x40) >> 6 << 3
+        right = (bits & 0x38) >> 3 | (bits & 0x80) >> 7 << 3
+        flipped = (right & 0x07) | (left & 0x07) << 3 | (right & 0x08) << 3 | (left & 0x08) << 4
+        table[chr(0x2800 + bits)] = chr(0x2800 + flipped)
+    return table
+
+
+_PICTURE_MIRROR = _build_picture_mirror()
+
+
+def _is_graphic(ch):
+    """A character that draws a picture, not text: it separates the
+    segments of a row and never moves."""
+    o = ord(ch)
+    return (0x2500 <= o <= 0x259F        # box drawing, block elements
+            or 0x2800 <= o <= 0x28FF     # braille
+            or 0xE000 <= o <= 0xF8FF     # the icon fonts' private use area
+            or 0xF0000 <= o <= 0x10FFFD
+            or 0x1FB00 <= o <= 0x1FBFF)  # legacy computing: sextants
+
+
+# ---------------------------------------------------------------------------
+# The pass
+# ---------------------------------------------------------------------------
+# Escapes: SGR, which is carried with each cell; OSC 8, a hyperlink,
+# carried the same way; any other CSI (a cursor move) cuts the text into
+# pieces that are ordered apart.
+_ESCAPE = re.compile(r"\033\[[0-9;:<=>?]*[ -/]*[@-~]|\033\][^\033\a]*(?:\033\\|\a)")
+_SGR = re.compile(r"\033\[[0-9;:]*m\Z")
+_DIGIT = re.compile(r"[0-9۰-۹]")
+
+_CONTROLS = frozenset("\u200e\u200f\u061c\u202a\u202b\u202c\u202d\u202e"
+                      "\u2066\u2067\u2068\u2069")
+# What rides on the cell before it: marks, joiners, variation selectors
+_RIDERS = frozenset(("Mn", "Me"))
+
+
+def _rides(ch):
+    return (unicodedata.category(ch) in _RIDERS
+            or ch in "\u200c\u200d\ufe0e\ufe0f")
+
+
+_CUP = re.compile(r"\033\[(\d*);(\d*)H\Z")
+
+
+def display(text, width=None):
+    """`text` -- one row, or a floating overlay of cursor-addressed
+    pieces -- as it should be sent to the terminal.  With `width`, the
+    terminal's columns, and a view that has asked for it (set_mirror),
+    each row is laid out from the right: the pieces of the row trade
+    sides, pictures are drawn flipped, and text still reads its own way."""
+    mirror = width if (width and mirrored()) else None
+    if not text or not (active() or mirror):
+        return text
+    if not mirror:
+        needs_order = _reorder and _RTL_OR_CONTROL.search(text) is not None
+        needs_digits = ((_digits is not None or _to_latin)
+                        and _DIGIT.search(text) is not None)
+        if not needs_order and not needs_digits:
+            return text
+        if not needs_order:
+            if "\n" in text:
+                return "\n".join(_digits_only(line) for line in text.split("\n"))
+            return _digits_only(text)
+    if "\n" in text:
+        return "\n".join(display(line, width) for line in text.split("\n"))
+    # Cut at the escapes that move the cursor: each piece is ordered on
+    # its own, starting in the SGR state the piece before left.  A row
+    # is a piece that starts at the first column; a piece of an overlay
+    # starts where the cursor was sent.
+    out = []
+    tokens = []
+    pos = 0
+    state = _EMPTY
+    col = 1                     # where the piece starts, if known
+    for m in _ESCAPE.finditer(text):
+        if m.start() > pos:
+            tokens.append(("t", text[pos:m.start()]))
+        seq = m.group()
+        if _SGR.match(seq) or seq.startswith("\033]8;"):
+            tokens.append(("e", seq))
+        else:
+            piece, state, cols = _order_piece(tokens, state, mirror, col)
+            if mirror and col is not None and out and cols:
+                out[-1] = _moved(out[-1], mirror, col, cols)
+            out.append(piece)
+            out.append(seq)
+            tokens = []
+            cup = _CUP.match(seq)
+            col = int(cup.group(2) or 1) if cup else None
+        pos = m.end()
+    if pos < len(text):
+        tokens.append(("t", text[pos:]))
+    piece, _state, cols = _order_piece(tokens, state, mirror, col)
+    if mirror and col is not None and out and cols:
+        out[-1] = _moved(out[-1], mirror, col, cols)
+    out.append(piece)
+    return "".join(out)
+
+
+def _moved(cup, width, col, cols):
+    """The cursor escape `cup` sending a piece `cols` wide, which the
+    view put at `col`, to where the mirrored layout has it."""
+    m = _CUP.match(cup)
+    if not m:
+        return cup
+    new = max(1, width - (col - 1) - cols + 1)
+    return f"\033[{m.group(1)};{new}H"
+
+
+# A cell's drawing state: its attributes (bold, reverse...), its
+# foreground, its background, and the hyperlink it is in.  Kept as
+# fields rather than as the escapes that set them, so a mirrored row can
+# give a cell the background of the picture at its new column.
+_EMPTY = ((), "", "", "")
+_ATTR_OFF = {"22": ("1", "2"), "21": ("1",), "23": ("3",), "24": ("4",), "25": ("5", "6"),
+             "27": ("7",), "28": ("8",), "29": ("9",), "55": ("53",), "59": ("58",)}
+
+
+def _sgr_groups(params):
+    """The parameter groups of one SGR: "38;2;r;g;b" is one group."""
+    parts = params.split(";") if params else ["0"]
+    i = 0
+    while i < len(parts):
+        p = parts[i] or "0"
+        if p in ("38", "48", "58") and i + 1 < len(parts):
+            size = 3 if parts[i + 1] == "5" else 5 if parts[i + 1] == "2" else 1
+            yield ";".join(parts[i:i + size])
+            i += size
+        else:
+            yield p
+            i += 1
+
+
+def _next_state(state, seq):
+    """The state after the escape `seq`, an SGR or an OSC 8 hyperlink."""
+    attrs, fgc, bgc, link = state
+    if seq.startswith("\033]"):
+        closing = seq.startswith("\033]8;;\033") or seq.startswith("\033]8;;\a")
+        return attrs, fgc, bgc, ("" if closing else seq)
+    attrs = set(attrs)
+    for group in _sgr_groups(seq[2:-1]):
+        head = group.split(";")[0].split(":")[0]
+        code = int(head) if head.isdigit() else -1
+        if code == 0:
+            attrs, fgc, bgc = set(), "", ""
+        elif 30 <= code <= 37 or 90 <= code <= 97 or code == 38:
+            fgc = group
+        elif code == 39:
+            fgc = ""
+        elif 40 <= code <= 47 or 100 <= code <= 107 or code == 48:
+            bgc = group
+        elif code == 49:
+            bgc = ""
+        elif head in _ATTR_OFF:
+            attrs = {a for a in attrs if a.split(":")[0].split(";")[0] not in _ATTR_OFF[head]}
+        else:
+            if code == 58:
+                attrs = {a for a in attrs if not a.startswith("58")}
+            attrs.add(group)
+    return tuple(sorted(attrs)), fgc, bgc, link
+
+
+def _sgr(state):
+    """The one escape that sets `state`'s drawing from nothing."""
+    attrs, fgc, bgc, _link = state
+    return "\033[" + ";".join(("0", *attrs, *((fgc,) if fgc else ()),
+                                *((bgc,) if bgc else ()))) + "m"
+
+
+def _set_state(have, want):
+    """Escapes that take the terminal from state `have` to `want`."""
+    out = ""
+    if have[:3] != want[:3]:
+        out += _sgr(want)
+    if have[3] != want[3]:
+        out += want[3] or "\033]8;;\033\\"
+    return out
+
+
+def for_stream(text, stream=None):
+    """`text` for `stream`: in display order on a terminal; in logical
+    order to a pipe, for waybar or polybar, whose renderers reorder and
+    shape by themselves, with only the digits changed."""
+    import sys
+    stream = sys.stdout if stream is None else stream
+    try:
+        tty = stream.isatty()
+    except Exception:
+        tty = False
+    if tty:
+        return display(text)
+    if _digits is None and not _to_latin:
+        return text
+    return "\n".join(_digits_only(line) for line in text.split("\n"))
+
+
+def _localise(ch):
+    if _to_latin:
+        o = ord(ch)
+        if 0x06F0 <= o <= 0x06F9:
+            return chr(o - 0x06F0 + 0x30)
+        if 0x0660 <= o <= 0x0669:
+            return chr(o - 0x0660 + 0x30)
+        return {_DECIMAL_MARK: ".", _PERCENT_SIGN: "%"}.get(ch, ch)
+    if "0" <= ch <= "9":
+        return _digits[ord(ch) - 0x30]
+    return ch
+
+
+def _digits_only(text):
+    """Digits in the reader's set, outside the escapes and identifiers."""
+    parts = []
+    pos = 0
+    for m in _ESCAPE.finditer(text):
+        parts.append(_digit_text(text[pos:m.start()]))
+        parts.append(m.group())
+        pos = m.end()
+    parts.append(_digit_text(text[pos:]))
+    return "".join(parts)
+
+
+_POINT = re.compile(r"(?<=[0-9])\.(?=[0-9])")
+_PERCENT_AFTER = re.compile(r"(?<=[0-9])%")
+_TO_NATIVE = {}
+_TO_LATIN = {**{0x06F0 + d: 0x30 + d for d in range(10)},
+             **{0x0660 + d: 0x30 + d for d in range(10)},
+             ord(_DECIMAL_MARK): ".", ord(_PERCENT_SIGN): "%"}
+
+
+def _digit_text(s):
+    # A row being reordered for its right-to-left text reaches here for
+    # its digits too, in a language that leaves them alone.
+    if not s or (_digits is None and not _to_latin) or not _DIGIT.search(s):
+        return s
+    if _to_latin:
+        return s.translate(_TO_LATIN)
+    table = _TO_NATIVE.get(_digits)
+    if table is None:
+        table = _TO_NATIVE[_digits] = {0x30 + d: _digits[d] for d in range(10)}
+    if "." in s:
+        s = _POINT.sub(_DECIMAL_MARK, s)
+    if "%" in s:
+        s = _PERCENT_AFTER.sub(_PERCENT_SIGN, s)
+    return s.translate(table)
+
+
+def _convert_digits(chars, protected):
+    """Convert, in place, the digits of a logical sequence of cell texts,
+    with a decimal point between two digits and a percent sign after one
+    written the reader's way."""
+    n = len(chars)
+    for i in range(n):
+        if protected[i]:
+            continue
+        c = chars[i]
+        if not c:
+            continue
+        ch = c[0]
+        if _to_latin:
+            new = _localise(ch)
+        elif "0" <= ch <= "9":
+            new = _localise(ch)
+        elif ch == "." and 0 < i < n - 1 and _is_digit(chars[i - 1]) and _is_digit(chars[i + 1]):
+            new = _DECIMAL_MARK
+        elif ch == "%" and i > 0 and _is_digit(chars[i - 1]):
+            new = _PERCENT_SIGN
+        else:
+            continue
+        chars[i] = new + c[1:]
+
+
+def _is_digit(c):
+    return bool(c) and ("0" <= c[0] <= "9" or "۰" <= c[0] <= "۹")
+
+
+def _arabic_commas(cells):
+    """A comma between two words in Arabic script is the Arabic comma,
+    ، -- "تهران، استان تهران", however the parts were joined -- and in a
+    right-to-left interface, one beside a word in Arabic script is too:
+    "South Khorasan، ایران" is a Persian list with a Latin name in it."""
+    from linecast.terminal.shaping import is_arabic_letter
+    n = len(cells)
+    for k in range(n):
+        if cells[k][0] != ",":
+            continue
+        p = k - 1
+        while p >= 0 and cells[p][0] == " ":
+            p -= 1
+        q = k + 1
+        while q < n and cells[q][0] == " ":
+            q += 1
+        if p < 0 or q >= n:
+            continue
+        before = is_arabic_letter(cells[p][0][0])
+        after = is_arabic_letter(cells[q][0][0])
+        if (before and after) or (_ui_rtl and (before or after)):
+            cells[k][0] = "\u060c"
+
+
+_MINUS = frozenset("-\u2212")
+_UNIT_LETTERS = frozenset("CFK")
+
+
+def _number_classes(cells, classes):
+    """Two readings the algorithm leaves to the program, made the way a
+    number is read: a minus sign that begins a number belongs to it, so
+    "−۳°" never comes apart; and a degree sign before a unit letter is
+    part of the unit, so "°C" reads as one Latin token and not "C°"."""
+    n = len(cells)
+    for k in range(n):
+        ch = cells[k][0][0]
+        if ch in _MINUS and k + 1 < n and classes[k + 1] in ("EN", "AN"):
+            if k == 0 or classes[k - 1] not in ("EN", "AN", "L", "R", "AL"):
+                classes[k] = classes[k + 1]
+        elif ch == "°" and k + 1 < n and cells[k + 1][0][0] in _UNIT_LETTERS:
+            classes[k] = "L"
+
+
+def _order_piece(tokens, state, mirror=None, col=None):
+    """One piece of a row in display order, from ("t", text) and
+    ("e", escape) tokens, starting in `state`.  With `mirror`, the
+    terminal's width, the piece is laid out from the right; `col` is
+    where the view started it (1 for a row), None when unknown.  Returns
+    the piece, the state it leaves the terminal in, and its width in
+    cells when it was mirrored (else 0)."""
+    flip = bool(mirror) and col is not None
+    if not flip and not any(kind == "t" and _RTL_OR_CONTROL.search(s)
+                            for kind, s in tokens):
+        for kind, s in tokens:
+            if kind == "e":
+                state = _next_state(state, s)
+        return ("".join(_digits_only(s) if kind == "t" else s
+                        for kind, s in tokens), state, 0)
+    # The algorithm and the shaping are needed only once a row holds
+    # right-to-left text or is mirrored, so a run without either never
+    # loads them
+    from linecast.terminal.shaping import FORM_CHARS, ZWJ, ZWNJ, joining_type, shape
+    from linecast.terminal.uba import (
+        MIRRORING_GLYPH, STRONG_R, bidi_class, bracket_info, resolve_levels, visual_order,
+    )
+
+    # Cells, each with the state it is drawn in and the escapes that
+    # come before it
+    start_state = state
+    cells = []       # [text, state]
+    lead = []
+    pending = []
+    for kind, s in tokens:
+        if kind == "e":
+            pending.append(s)
+            state = _next_state(state, s)
+            continue
+        for ch in s:
+            if cells and _rides(ch) and cells[-1][0][0] not in _CONTROLS:
+                cells[-1][0] += ch
+                continue
+            cells.append([ch, state])
+            lead.append(pending)
+            pending = []
+    tail = pending
+    final_state = state
+    n = len(cells)
+    if not n:
+        return "".join(s for _kind, s in tokens), final_state, 0
+
+    _arabic_commas(cells)
+    if _visual:
+        shape(cells)
+    classes = ["S" if _is_graphic(c[0][0]) else bidi_class(c[0][0]) for c in cells]
+    _number_classes(cells, classes)
+
+    # Inside an LRI: an identifier, which keeps its ASCII digits, or a
+    # picture, which a mirrored row leaves as drawn
+    protected = []
+    depth = []
+    for cell in cells:
+        ch = cell[0][0]
+        if ch in (LRI, RLI, FSI):
+            depth.append(ch)
+        elif ch == PDI and depth:
+            depth.pop()
+        protected.append(LRI in depth)
+    if _digits is not None or _to_latin:
+        texts = [c[0] for c in cells]
+        _convert_digits(texts, protected)
+        for c, t in zip(cells, texts):
+            c[0] = t
+
+    # Segments: text between graphics and gaps of two spaces or more,
+    # never cut inside an isolate.  A graphic or a gap is a segment of
+    # its own, of one cell, which stays where it is.
+    segments = []
+    seg_start = None
+    iso = 0
+    for k in range(n):
+        ch = cells[k][0][0]
+        if ch in (LRI, RLI, FSI):
+            iso += 1
+        elif ch == PDI and iso:
+            iso -= 1
+        gap = not iso and (classes[k] == "S" or (ch == " " and (
+            (k + 1 < n and cells[k + 1][0][0] == " ")
+            or (k > 0 and cells[k - 1][0][0] == " "))))
+        if gap:
+            if seg_start is not None:
+                segments.append((seg_start, k))
+                seg_start = None
+            segments.append((k, k + 1))
+        elif seg_start is None:
+            seg_start = k
+    if seg_start is not None:
+        segments.append((seg_start, n))
+    # A segment's own leading and trailing spaces stay where they are,
+    # as a gap's do
+    trimmed = []
+    for a, b in segments:
+        while b - a > 1 and cells[a][0] == " ":
+            trimmed.append((a, a + 1))
+            a += 1
+        tail_spaces = []
+        while b - a > 1 and cells[b - 1][0] == " ":
+            b -= 1
+            tail_spaces.append((b, b + 1))
+        trimmed.append((a, b))
+        trimmed.extend(reversed(tail_spaces))
+    segments = trimmed
+
+    seg_orders = []
+    mirrored = [False] * n
+    handed = [False] * n           # cells the terminal is left to order
+    before = {}                    # isolate marks the terminal orders by
+    after = {}
+    for a, b in segments:
+        types = classes[a:b]
+        if b - a == 1 or not (flip or any(t in _MOVES for t in types)):
+            seg_orders.append(range(a, b))
+            continue
+        # In a row laid out from the right every piece of text reads as a
+        # right-to-left paragraph: a Latin phrase keeps its order, but two
+        # numbers a single cell apart (a low and a high either side of a
+        # one-cell bar) trade places as the row does.
+        base = 1 if flip or (_ui_rtl and any(t in STRONG_R for t in types)) else None
+        brackets = [bracket_info(cells[i][0][0]) for i in range(a, b)]
+        para, levels = resolve_levels(types, base, brackets)
+        for j, lv in enumerate(levels):
+            if lv is not None and lv % 2:
+                mirrored[a + j] = True
+        # The characters X9 removes are controls this pass drops; they
+        # keep a place in the order so nothing is lost
+        visual = visual_order([para if lv is None else lv for lv in levels])
+        if not _visual and any(t in STRONG_R for t in types):
+            # The terminal orders it: in logical order, in an isolate of
+            # the direction resolved here, so it stays where it stands.
+            # A piece that reads the same either way is left bare.  A
+            # piece with no right-to-left letter in it (two numbers either
+            # side of an arrow) goes out in this pass's order instead,
+            # which no terminal would change: Konsole does not order an
+            # isolate that has no right-to-left letter to go by.
+            seg_orders.append(range(a, b))
+            for j in range(a, b):
+                handed[j] = True
+            if visual != list(range(b - a)):
+                before[a] = RLI if para else LRI
+                after[b - 1] = PDI + after.get(b - 1, "")
+                if para:
+                    _isolate_numbers(cells, classes, a, b, before, after)
+            continue
+        seg_orders.append([a + j for j in visual])
+
+    out = []
+    have = start_state
+    prev = -1
+    cols = 0
+    picture = None
+    if flip:
+        # Laid out from the right: the segments trade sides, and a row
+        # shorter than the screen is padded on the left
+        seg_orders.reverse()
+        from linecast.terminal.textwidth import visible_len
+        widths = [0 if c[0][0] in _CONTROLS else visible_len(c[0]) for c in cells]
+        cols = sum(widths)
+        # The background is the picture's, not the text's: each column
+        # takes the background of the column it mirrors, so a label on a
+        # gradient bar, whose text keeps its order, sits on the bar as it
+        # runs from the right
+        picture = []
+        for k, w in enumerate(widths):
+            picture.extend([k] * w)
+        if col == 1 and cols < mirror:
+            out.append(_set_state(have, _EMPTY) + " " * (mirror - cols))
+            have = _EMPTY
+            prev = -2          # the row's own escapes no longer apply
+    order = [k for seg in seg_orders for k in seg]
+    column = 0
+    for k in order:
+        text, want = cells[k]
+        if picture is not None:
+            under = picture[cols - 1 - column] if 0 <= cols - 1 - column < cols else k
+            want = (want[0], want[1], cells[under][1][2], want[3])
+            column += widths[k]
+        ch = text[0]
+        if not _visual:
+            pass           # the controls and joiners are the terminal's to read
+        elif ch in _CONTROLS:
+            text = ""
+        elif ch in FORM_CHARS or joining_type(ch) in ("D", "R"):
+            text = text.replace(ZWNJ, "").replace(ZWJ, "")
+        if mirrored[k] and ch in MIRRORING_GLYPH:
+            text = MIRRORING_GLYPH[ch] + text[1:]
+            if handed[k]:
+                # Drawn as mirrored here, in an isolate of its own at an
+                # even level, where no terminal mirrors it a second time:
+                # Konsole mirrors nothing, VTE mirrors what is at an odd level
+                text = LRI + text + PDI
+        elif flip and ch in _PICTURE_MIRROR and not protected[k]:
+            text = _PICTURE_MIRROR[ch] + text[1:]
+        if k == prev + 1 and picture is None:
+            out.extend(lead[k])      # the row's own escapes, in their order
+        else:
+            out.append(_set_state(have, want))
+        have = want
+        out.append(before.get(k, "") + text + after.get(k, ""))
+        prev = k
+    if prev == n - 1:
+        out.extend(tail)
+    else:
+        out.append(_set_state(have, final_state))
+    return "".join(out), final_state, cols
+
+
+_MOVES = frozenset(("R", "AL", "AN", "RLE", "RLO", "RLI", "FSI"))
+
+
+def _isolate_numbers(cells, classes, a, b, before, after):
+    """In a right-to-left piece the terminal orders, the numbers this
+    pass would keep whole (_number_classes: a leading minus, a unit
+    after the degree sign) go in isolates of their own, so the terminal
+    keeps them whole too."""
+    k = a
+    while k < b:
+        if classes[k] in ("EN", "AN") or (cells[k][0][0] in _MINUS and k + 1 < b
+                                          and classes[k + 1] in ("EN", "AN")):
+            j = k
+            while j < b and (classes[j] in ("EN", "AN", "CS", "ET")
+                             or cells[j][0][0] in _MINUS or cells[j][0][0] == "°"):
+                j += 1
+            if j < b and cells[j][0][0] in _UNIT_LETTERS and cells[j - 1][0][0] == "°":
+                j += 1
+            token = "".join(c[0][0] for c in cells[k:j])
+            if token[:1] in _MINUS or token.endswith(("°C", "°F", "°K")):
+                before[k] = before.get(k, "") + LRI
+                after[j - 1] = PDI + after.get(j - 1, "")
+            k = max(j, k + 1)
+        else:
+            k += 1

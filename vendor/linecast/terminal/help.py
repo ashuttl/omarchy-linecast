@@ -1,0 +1,283 @@
+"""The controls shared by the live views, with one modal and one layout."""
+
+import math
+import re
+
+from linecast.terminal import theme as _theme
+from linecast.terminal.color import RESET, bg, fg
+from linecast.terminal.textwidth import visible_len
+from linecast.terminal.help_i18n import hs
+from linecast.terminal.textwidth import fit, glyphs, pad
+from linecast.terminal.box import at, centre, place
+
+
+def hint(lang='en', width=80, *, controls=()):
+    """A persistent, translated invitation; the key survives tight layouts."""
+    label = f"? {hs('hint_help', lang)}"
+    label = label if visible_len(label) <= width else ('?' if width > 0 else '')
+    for key, word in reversed(controls):
+        trial = f"{key} {hs(word, lang)}  {label}"
+        if visible_len(trial) <= width:
+            label = trial
+    return label
+
+
+def footer(line, width, lang='en', *, controls=()):
+    """Add help at the right of the row, through its last column, without truncating the readout.
+
+    Callers with a dense footer budget for hint() before choosing their
+    content. Trailing padding is expendable; text and credits are not.
+    """
+    line = re.sub(r' +(?=(?:\033\[[0-9;]*m)*$)', '', line)
+    used = visible_len(line)
+    label = hint(lang, width - used - 2, controls=controls)
+    if not label:
+        return line
+    ink = _theme.ensure_contrast(_theme.surface_bg(0.55), _theme.theme_bg, 4.5)
+    return f"{line}{RESET}{' ' * (width - used - visible_len(label))}{fg(*ink)}{label}{RESET}"
+
+
+def paint_text(fb, overlays, text, x, row, color=None):
+    """Readable text on the image's own cells, including wide and combining glyphs."""
+    color = color or _theme.surface_bg(0.55)
+    for c, glyph, width in glyphs(text):
+        cx = x + c
+        if cx < 0 or cx + width > fb.graph_w or not 0 <= row < fb.graph_h:
+            break
+        cell = fb.cell_bg(cx, row)
+        ink = _theme.ensure_contrast(color, cell, 4.5)
+        if _theme.contrast_ratio(ink, cell) < 4.5:
+            ink = _theme.best_contrast(((0, 0, 0), (255, 255, 255)), cell, 4.5)
+        overlays[(cx, row)] = (glyph, ink, False)
+        for extra in range(1, width):
+            overlays[(cx + extra, row)] = ('', ink, False)
+
+
+def paint_hint(fb, overlays, lang='en', rows=None):
+    """Tuck help into a free image corner, keeping existing labels intact."""
+    rows = (fb.graph_h - 1, 0, fb.graph_h - 2, 1) if rows is None else rows
+    for label in (hint(lang, fb.graph_w - 2), '?'):
+        width = visible_len(label)
+        for row in rows:
+            for x in (fb.graph_w - width - 1, 1):
+                cells = range(x - 1, x + width + 1)
+                if x < 1 or any((c, row) in overlays for c in cells):
+                    continue
+                paint_text(fb, overlays, f' {label} ', x - 1, row)
+                return True
+    return False
+
+# Keys are the spellings a user types, not the live loop's decoded actions.
+# The gesture words among them are English here and translated by mark().
+GESTURES = {'wheel': 'key_wheel', 'space': 'key_space', 'hover': 'key_hover',
+            'click': 'key_click', 'drag': 'key_drag', 'enter': 'key_enter'}
+
+
+def mark(text, lang='en'):
+    """A key column entry in the display language: the gesture words
+    translated, the letters and arrows left as they are typed."""
+    return ' / '.join(hs(GESTURES[part], lang) if part in GESTURES else part
+                      for part in text.split(' / '))
+
+
+CONTROLS = {
+    'weather': [('wheel / ←→', 'forecast'), ('space / n', 'now'),
+                ('hover', 'help_hover'), ('click', 'alert'), ('o', 'browser'),
+                ('r', 'refresh'), ('v', 'weather_views')],
+    'weather_year': [('hover', 'help_hover'), ('v', 'weather_views'), ('c', 'bar_colors')],
+    'weather_month': [('wheel / ←→', 'months'), ('space / n', 'now'),
+                      ('hover', 'help_hover'), ('v', 'weather_views'),
+                      ('m', 'month_colors'), ('r', 'history_refresh')],
+    'tides': [('wheel / ←→', 'time30'), ('space / n', 'now'), ('hover', 'help_hover'),
+              ('v', 'tide_views')],
+    'tides_month': [('wheel / ←→', 'months'), ('space / n', 'now'),
+                    ('hover', 'tide_times'), ('v', 'tide_views')],
+    'tides_year': [('wheel / ←→', 'years'), ('space / n', 'now'),
+                   ('hover', 'help_hover'), ('v', 'tide_views')],
+    'tides_makeup': [('wheel / ←→', 'months'), ('space / n', 'now'),
+                     ('hover', 'help_hover'), ('v', 'tide_views')],
+    # A source that cannot fill a year (tides.providers year_view)
+    'tides_no_year': [('wheel / ←→', 'time30'), ('space / n', 'now'),
+                      ('hover', 'help_hover'), ('v', 'tide_views_no_year')],
+    'tides_month_no_year': [('wheel / ←→', 'months'), ('space / n', 'now'),
+                            ('hover', 'tide_times'), ('v', 'tide_views_no_year')],
+    'sunshine': [('wheel / ←→', 'time15'), ('space / n', 'now'),
+                 ('v / y', 'year'), ('t', 'hide_text')],
+    'sunshine_year': [('hover', 'sun_times'), ('v / y', 'year'), ('t', 'hide_text')],
+    'moon': [('wheel / ←→', 'time15'), ('space / n', 'now'),
+             ('drag', 'turn_moon'), ('v', 'calendar'), ('t', 'hide_text')],
+    'moon_calendar': [('wheel / ←→', 'months'), ('space / n', 'now'),
+                      ('hover', 'moon_times'), ('click', 'day'), ('v', 'calendar')],
+    'sky': [('drag / wasd', 'look'), ('wheel / ←→', 'time15'), ('+ -', 'help_zoom'),
+            ('space / n', 'now'), ('hover', 'help_hover'), ('/', 'help_search'),
+            ('enter', 'target'), ('c', 'figures'), ('t', 'cultures'),
+            ('p', 'play_time'), ('1–8', 'compass'), ('9', 'zenith'), ('m', 'moon')],
+    'radar': [('drag / wasd', 'help_pan'), ('wheel / ←→', 'frames'), ('+ -', 'help_zoom'),
+              ('space / n', 'play'), ('hover', 'radar_hover'), ('c', 'temperature'),
+              ('W', 'wind'), ('A', 'alerts'), ('t', 'theme'), ('S', 'satellite')],
+}
+
+
+def entries(view, lang, credits=()):
+    """The panel's rows: the controls, then any data credits after a
+    spacer, as the maps panel lays its own out."""
+    rows = [(mark, hs(key, lang)) for mark, key in CONTROLS[view]] + [
+        ('?', hs('help_keys', lang)), ('q', hs('help_quit', lang))]
+    credits = [credit for credit in credits if credit]
+    if credits:
+        rows.append(None)
+        rows += [('', credit) for credit in credits]
+    return rows
+
+
+def wrap(text, width):
+    """Wrap words, or long unspaced labels, without splitting wide cells."""
+    out, line = [], ''
+    for word in text.split():
+        trial = f'{line} {word}'.strip()
+        if visible_len(trial) <= width:
+            line = trial
+            continue
+        if line:
+            out.append(line)
+        line = ''
+        for ch in word:
+            if visible_len(line + ch) > width:
+                out.append(line)
+                line = ''
+            line += ch
+    if line:
+        out.append(line)
+    return out
+
+
+def _key_digits(key, lang):
+    """A key's label with its digits kept as printed on the keyboard, in
+    a language with digits of its own: "1-8", "9"."""
+    from linecast.terminal.bidi import identifier
+    from linecast._i18n import is_rtl
+    if not is_rtl(lang):
+        return key
+    return re.sub(r"[0-9]+(?:[-–][0-9]+)?", lambda m: identifier(m.group()), key)
+
+
+def panel(content, cols, rows, lang='en', page=0):
+    """A centered panel and its page count. Short windows retain every key."""
+    if cols < 16 or rows < 5:
+        note = fit('? / esc', cols)
+        return f'{at(1, 1)}{RESET}{note}', 1
+    from linecast.terminal import bidi as _bidi
+    from linecast._i18n import is_rtl
+    # Read from the right: the keys go in a column on the right, the
+    # descriptions against it. A view laid out from the right (weather,
+    # tides) gets this from its flip; the others (maps, the sky) here.
+    rtl = is_rtl(lang) and not _bidi.mirrored()
+    content = [entry if entry is None else (_key_digits(mark(entry[0], lang), lang), entry[1])
+               for entry in content]
+    label_width = max((visible_len(entry[1]) for entry in content if entry), default=0)
+    # the key column is as wide as its widest entry: a translated
+    # gesture word can run past the dozen cells the English ones need
+    key_width = max([12, *(visible_len(entry[0]) + 1 for entry in content if entry)])
+    width = min(cols - 4, max(47, label_width + key_width + 5))
+    if width < key_width + 24:
+        key_width = 0
+    laid_out = []
+    for entry in content:
+        if entry is None:
+            laid_out.append(None)
+            continue
+        key, text = entry
+        if key and key_width:
+            pieces = wrap(text, width - key_width - 3)
+            laid_out.extend((key if i == 0 else ' ', line)
+                            for i, line in enumerate(pieces))
+        else:
+            if key:
+                laid_out.append(('', key))
+            laid_out.extend(('', line) for line in wrap(text, width - 2))
+    budget = rows - 4
+    if len(laid_out) > budget:
+        laid_out = [entry for entry in laid_out if entry is not None]
+    pages = max(1, math.ceil(len(laid_out) / budget))
+    page = min(max(0, page), pages - 1)
+    shown = laid_out[page * budget:(page + 1) * budget]
+    surface = _theme.surface_bg(0.10)
+    ink = _theme.ensure_contrast(_theme.theme_fg, surface, 4.5)
+    dim = _theme.ensure_contrast(_theme.surface_bg(0.55), surface, 3.0)
+    key_ink = _theme.ensure_contrast(_theme.theme_ansi[3], surface, 4.5)
+
+    def border(left, text, right):
+        text = pad(fit(' ' + text + ' ', width), width, '^', '─')
+        return f'{bg(*surface)}{fg(*dim)}{left}{text}{right}{RESET}'
+
+    title = hs('help_title', lang)
+    if pages > 1:
+        title += f'  ←→ {page + 1}/{pages}'
+    lines = [border('╭', title, '╮')]
+    for entry in shown:
+        if entry is None:
+            body = ' ' * width
+        else:
+            key, text = entry
+            if key and rtl:
+                key = fit(key, key_width - 1)
+                label = fit(text, width - key_width - 4)
+                room = width - 4 - visible_len(label) - key_width
+                body = (' ' * (1 + room) + f'{fg(*ink)}{label}  '
+                        + pad(f'{fg(*key_ink)}{key}', key_width, '>'))
+            elif key:
+                key = fit(key, key_width)
+                label = fit(text, width - key_width - 3)
+                body = (' ' + pad(f'{fg(*key_ink)}{key}', key_width)
+                        + f' {fg(*ink)}{label}')
+            elif rtl:
+                line = fit(text, width - 2)
+                body = pad(f'{fg(*dim)}{line}', width - 1, '>')
+            else:
+                body = f' {fg(*dim)}{fit(text, width - 2)}'
+            body = pad(body, width)
+        lines.append(f'{bg(*surface)}{fg(*dim)}│{body}{fg(*dim)}│{RESET}')
+    lines.append(border('╰', hs('help_close', lang), '╯'))
+    top, left = centre(cols, rows, width + 2, len(lines))
+    return place(lines, top, left), pages
+
+
+class HelpPanel:
+    """Help owns input while open; a command dismisses it and passes through."""
+
+    def __init__(self, view, lang='en', content=None):
+        self.view = view
+        self.lang = lang
+        self.content = content
+        self.open = False
+        self.page = 0
+        self.pages = 1
+
+    def handle(self, action):
+        if action == 'key:?':
+            self.open = not self.open
+            self.page = 0
+            return True
+        if not self.open:
+            return False
+        if action in ('quit', 'escape'):
+            self.open = False
+            return True
+        if isinstance(action, tuple):
+            if action[0] == 'mouse' and action[1] & 64:
+                self.page = (self.page + (1 if action[1] & 1 else -1)) % self.pages
+            return True  # never click or drag the view through the panel
+        if action in ('fwd', 'back') and self.pages > 1:
+            self.page = (self.page + (1 if action == 'fwd' else -1)) % self.pages
+            return True
+        if action is not None:
+            self.open = False
+        return False
+
+    def render(self, cols, rows):
+        view = self.view() if callable(self.view) else self.view
+        content = (self.content(cols, rows) if self.content is not None
+                   else entries(view, self.lang))
+        out, self.pages = panel(content, cols, rows, self.lang, self.page)
+        self.page = min(self.page, self.pages - 1)
+        return out

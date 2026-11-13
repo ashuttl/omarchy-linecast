@@ -1,0 +1,270 @@
+"""The live radar: what runs when you type `radar`.
+
+main() settles the arguments, resolves the location and picks the
+source, then runs render_radar under live_loop as a RadarApp — the
+state that gives the view its hands: zoom, drag, the layer keys and
+the theme picker.  --print renders once and exits.  Everything drawn
+is in radar.view; the frames and their prefetcher are in radar.frames.
+"""
+
+import os
+import sys
+
+from linecast.radar import frames as _frames
+from linecast.radar import sources as _sources
+from linecast.terminal.framebuffer import get_terminal_size
+from linecast._geo import wrap_lon
+from linecast.terminal.live import LiveApp, nudge, print_frame
+from linecast.radar.frames import N_FRAMES, _sat_timeline
+from linecast.radar.i18n import rs
+from linecast._xyz import bbox_for
+from linecast.radar.iem import FRAME_STEP
+from linecast.radar.sources import (
+    DEFAULT_THEME, THEMES, _in_conus, get_source, theme_id,
+)
+from linecast.radar.ui import ThemePicker
+from linecast._runtime import RuntimeConfig, place_for, set_current
+from linecast._parsers import radar_parser
+from linecast.terminal.spinner import Spinner
+from linecast.radar.view import LAYERS, parse_layers, render_radar
+
+
+def view_lat(lat):
+    """The latitude a view may centre on.
+
+    The tile sources are web mercator, which runs out a little past 85
+    degrees; a window whose bottom edge is above that has no tile rows
+    and stitching it fails.  The marker keeps the true location; the
+    view stops where the map does, as it does for a pan and in maps.
+    """
+    return max(-80.0, min(80.0, lat))
+
+
+class RadarApp(LiveApp):
+    """The live radar's state and keys, run under live_loop.
+
+    The centre pans while the marker stays at the true location; the
+    layer keys toggle the condition layers and the warning outlines and
+    cycle radar and satellite; + and - zoom; t opens the theme picker, which takes
+    every key while open.  A theme change swaps the source for one
+    with the same index, so nothing is fetched again.
+    """
+
+    interval = FRAME_STEP   # pick up a new composite every 5 min
+    mouse = True
+    auto_play = True
+    play_interval = 0.2     # animation frame rate (~5 fps)
+
+    help_view = 'radar'
+
+    def __init__(self, runtime, lat, lon, location_name, zoom, layers,
+                 layer, theme):
+        self.runtime = runtime
+        self.home = (lat, lon)         # the marker stays at the true location
+        self.location_name = location_name
+        self.zoom = zoom
+        self.lat, self.lon = view_lat(lat), lon  # the view centre; pans
+        self.region = _in_conus(lat, lon)
+        self.layers = set(layers)
+        self.alerts = True             # warning outlines; A toggles them
+        self.layer = layer
+        self.theme = theme             # active theme id (the picker updates it)
+        self.pan_preview = (0, 0)      # live cell offset while a drag is in progress
+        self.picker = ThemePicker()
+
+    def on_action(self, key):
+        if key in ('w', 'a', 's', 'd'):
+            cols, rows = get_terminal_size()
+            gw, hc = max(20, cols), max(8, rows - 2)
+            dcol, drow = {'w': (0, hc * 0.1), 'a': (gw * 0.1, 0),
+                         's': (0, -hc * 0.1), 'd': (-gw * 0.1, 0)}[key]
+            return self.on_drag(dcol, drow, True)
+        if key in ('c', 'W'):
+            self.layers.symmetric_difference_update(
+                {'temp' if key == 'c' else 'wind'})
+            return True
+        if key == 'A':
+            self.alerts = not self.alerts
+            return True
+        if key == 'S':
+            # cycle layers; a no-op on sources without a cloud mosaic
+            if not _sat_timeline():
+                return False
+            i = LAYERS.index(self.layer)
+            self.layer = LAYERS[(i + 1) % len(LAYERS)]
+            return True
+        if key == '+':
+            new_zoom = max(1.0, self.zoom / 1.5)
+        elif key == '-':
+            new_zoom = min(60.0, self.zoom * 1.5)
+        else:
+            return False
+        if new_zoom == self.zoom:
+            return False
+        self.zoom = new_zoom
+        return True
+
+    def intercept(self, action):
+        """Route keys to the theme picker; everything else passes through."""
+        source = _frames.source()
+        if not self.picker.handle(action, getattr(source, "themes", None),
+                                  getattr(source, "theme", None)):
+            return False
+        choice = self.picker.take_chosen()
+        if choice is not None:
+            self.theme = choice
+            # same index, no fetch
+            _frames.use(source.with_theme(choice))
+        return True
+
+    def on_wheel(self, direction, col, row):
+        """The wheel moves the theme picker's highlight while it is open,
+        as the arrows do; otherwise it steps the frames."""
+        if not self.picker.is_open:
+            return NotImplemented
+        return self.intercept('fwd' if direction > 0 else 'back')
+
+    def on_drag(self, dcol, drow, done):
+        if not done:
+            # mid-drag: update the screen-space preview offset only
+            changed = self.pan_preview != (dcol, drow)
+            self.pan_preview = (dcol, drow)
+            return changed
+        had_preview = self.pan_preview[0] or self.pan_preview[1]
+        self.pan_preview = (0, 0)
+        if not (dcol or drow):
+            return bool(had_preview)  # zero-delta release = plain click
+        # commit: dragging pulls the map, so the view centre moves the
+        # opposite way; the release re-render re-projects for real
+        cols, rows = get_terminal_size()
+        gw, hc = max(20, cols), max(8, rows - 2)
+        minlon, _, maxlon, _ = bbox_for(self.lat, self.lon, self.zoom, gw, hc)
+        lon_span = maxlon - minlon
+        self.lat = view_lat(self.lat + drow * self.zoom / hc)
+        self.lon = wrap_lon(self.lon + -dcol * lon_span / gw)
+        # crossing the CONUS boundary re-picks the source when the one in
+        # hand isn't LibreWXR: the natural moment to retry it after a
+        # fallback (a themed RainViewer is still a fallback).  The pick
+        # may wait on the network, so it lands later, off this thread.
+        r = _in_conus(self.lat, self.lon)
+        if r != self.region:
+            self.region = r
+            if getattr(_frames.source(), "kind", None) != "lwxr":
+                _frames.reroute(self.lat, self.lon, N_FRAMES, self.theme)
+        return True
+
+    def play_gate(self):
+        return not _frames.buffering()
+
+    def render(self, play_frame=0, playing=True, mouse_pos=None, **_):
+        themes = getattr(_frames.source(), "themes", None)
+        text, _failed = render_radar(
+            self.lat, self.lon, self.location_name, self.zoom,
+            play_frame=play_frame, playing=playing,
+            marker=self.home,
+            runtime=self.runtime, block=False, mouse_pos=mouse_pos,
+            pan_offset=self.pan_preview,
+            layers=frozenset(self.layers),
+            alerts=self.alerts,
+            layer=self.layer,
+            theme_menu=((list(themes), self.picker.sel)
+                        if self.picker.is_open and themes else None))
+        return text
+
+
+def main():
+    args = radar_parser().parse_args()
+    runtime = RuntimeConfig.from_sources(args)
+    set_current(runtime)
+
+    if args.search:
+        from linecast._geocode import print_search
+        print_search(args.search, lang=runtime.lang, prog="linecast radar")
+        return
+
+    theme_arg = (args.theme
+                 or os.environ.get("LINECAST_RADAR_THEME", "").strip()
+                 or DEFAULT_THEME)
+    theme = theme_id(theme_arg)
+    if theme is None:
+        print(f'Unknown radar theme "{theme_arg}". '
+              f'Themes: {", ".join(THEMES)}.', file=sys.stderr)
+        sys.exit(2)
+
+    layer_arg = (args.layers
+                 or os.environ.get("LINECAST_RADAR_LAYERS", "")).strip()
+    layers = parse_layers(layer_arg)
+    if layers is None:
+        print(f'Unknown radar layer in "{layer_arg}". Layers: temp, wind.',
+              file=sys.stderr)
+        sys.exit(2)
+
+    layer = {"radar": "radar", "satellite": "sat", "sat": "sat"}.get(
+        (args.layer or os.environ.get("LINECAST_RADAR_LAYER", "").strip()
+         or "radar").lower())
+    if layer is None:
+        print('Unknown radar layer. Layers: radar, satellite.',
+              file=sys.stderr)
+        sys.exit(2)
+
+    source_arg = (args.source
+                  or os.environ.get("LINECAST_RADAR_SOURCE", "")).strip().lower()
+    if source_arg:
+        if source_arg not in ("librewxr", "rainviewer", "iem"):
+            print('Unknown radar source. Sources: librewxr, rainviewer, iem.',
+                  file=sys.stderr)
+            sys.exit(2)
+        _sources.FORCED_SOURCE = source_arg
+
+    # everything from here to the first paint may block on the network
+    # (geocoding, the frame index, static-mode frame fetches) — spin
+    if not runtime.live:
+        # Ask the terminal how wide it draws things before the spinner
+        # has the screen: the probe wants stdin and stdout to itself.
+        from linecast.terminal.textwidth import calibrate_from_terminal
+        calibrate_from_terminal()
+    spin = Spinner(rs("loading", runtime.lang))
+    spin.start()
+    try:
+        lat, lon, _country, location_name, runtime = place_for(args, runtime, zone=True)
+        # a place set somewhere else has its own clock, which the frames'
+        # times are told in, as sky and sunshine tell theirs
+        from linecast._location import location_is_pinned, location_tzinfo
+        from linecast.radar import ui as _ui
+        _ui.use_zone(location_tzinfo(lat, lon) if location_is_pinned(args.location) else None)
+
+        # The place's name is for the header, and the source's index is
+        # what the first frame waits on: neither waits for the other.
+        from linecast._fanout import Fanout
+        from linecast._geocode import place_label
+        fanout = Fanout()
+        name = fanout.submit(place_label, lat, lon, location_name, runtime.lang)
+        _frames.use(get_source(lat, lon, N_FRAMES, theme))
+        location_name = fanout.settle(name, "place name", location_name, tag="radar",
+                                      note="the typed label or the coordinates")
+
+        if not runtime.live:
+            # static: play_frame 0 is the present (newest observed) frame
+            def render_once():
+                return render_radar(view_lat(lat), lon, location_name,
+                                    args.zoom, play_frame=0, playing=False,
+                                    marker=(lat, lon), runtime=runtime,
+                                    layers=layers, layer=layer)
+
+            static_out, failed = render_once()
+            if failed and _frames.fall_back():
+                # the source answered its index and then could not serve the
+                # tiles; the one we fall to keeps its own frame list, so the
+                # whole render goes again rather than the frame alone
+                static_out, _failed = render_once()
+    finally:
+        spin.stop()
+
+    if not runtime.live:
+        print_frame(static_out)
+        return
+
+    # a background index refresh that adds a frame repaints the timeline
+    _sources.on_index_refresh = nudge
+    RadarApp(runtime, lat, lon, location_name, args.zoom, layers, layer,
+             theme).run()

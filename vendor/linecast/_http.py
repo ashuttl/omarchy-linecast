@@ -1,36 +1,84 @@
-"""Shared HTTP + JSON fetch helpers."""
+"""Shared HTTP + JSON fetch helpers.
+
+Every request goes through fetch_bytes, which keeps one open connection
+per (scheme, host, port) per thread and reuses it for the next request
+to the same server.  A tile pyramid or a run of Open-Meteo calls then
+pays the TCP + TLS handshake once instead of once per request; a server
+that hangs up on an idle socket costs one reconnect.  Threads each keep
+their own connections (a threading.local), so worker pools never share
+a socket.
+
+The User-Agent is attached here by default, so callers only pass the
+headers that are specific to them.  So is Accept-Encoding: gzip, and a
+body the server declares gzipped comes back inflated, under the same
+byte cap as a plain one; Open-Meteo's ten-year archive is a quarter of
+the size on the wire that way.  A pre-gzipped body a static host serves
+without declaring it is left alone, for the caller to sniff.
+
+Redirects are followed here too, on both paths, and credentials do not
+follow them off their origin: once a hop leaves the (scheme, host, port)
+the request started on, Authorization, Cookie, X-API-Key and kin are
+dropped for the rest of the chain, and a keyed request redirected from
+HTTPS to plain HTTP fails rather than going out in the clear.
+"""
 
 import json
-import urllib.request
+import os
+import threading
+import urllib.parse
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from linecast._cache import read_cache, read_stale, write_cache
-from linecast._runtime import debug_log
+from linecast._cache import is_fresh, read_cache, read_stale, write_bytes_atomic, write_cache
+from linecast._log import debug_enabled, debug_log, log_failure, redact_url
+
+if TYPE_CHECKING:
+    import http.client
+    from collections.abc import Callable
+    from email.message import Message
+
+_REDIRECTS = (301, 302, 303, 307, 308)
+_MAX_REDIRECTS = 5
+
+# Headers that carry a credential, lowercased.  They go only to the
+# origin they were meant for; see _redirect_headers.
+_SENSITIVE_HEADERS = frozenset(
+    ("authorization", "proxy-authorization", "cookie", "x-api-key"))
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 # Hard ceilings on how much of a response body we will hold.  Real
 # payloads run a few hundred KB at most; anything bigger is a broken or
 # hostile server, and refusing it keeps memory — and everything
 # downstream of our stdout — bounded.
 MAX_JSON_BYTES = 8 * 1024 * 1024
-MAX_TILE_BYTES = 16 * 1024 * 1024
+MAX_BODY_BYTES = 16 * 1024 * 1024
 
 _CHUNK = 64 * 1024
 
+_local = threading.local()
 
-def read_limited(resp, limit):
+
+def read_limited(resp: "http.client.HTTPResponse", limit: int) -> bytes:
     """Stream a response body, refusing to keep more than limit bytes.
 
     An honest oversized response is refused from its Content-Length
     before a byte is read; a lying or chunked one is cut off as soon as
-    the stream crosses the limit.
+    the stream crosses the limit.  An early EOF before Content-Length
+    bytes have arrived is a failed fetch, never a cacheable partial body.
     """
     declared = getattr(resp, "length", None)
     if declared is not None and declared > limit:
         raise ValueError(f"response of {declared} bytes exceeds cap of {limit}")
-    chunks = []
+    chunks: list[bytes] = []
     total = 0
     while True:
         chunk = resp.read(_CHUNK)
         if not chunk:
+            # HTTPResponse.read(amt) does not raise on a short body as
+            # read() does, so streaming must check the original length.
+            if declared is not None and total < declared:
+                from http.client import IncompleteRead
+                raise IncompleteRead(b"".join(chunks), declared - total)
             return b"".join(chunks)
         total += len(chunk)
         if total > limit:
@@ -38,40 +86,356 @@ def read_limited(resp, limit):
         chunks.append(chunk)
 
 
-def gunzip_limited(data, limit):
-    """Decompress a gzip body, refusing to expand past limit bytes."""
+def gunzip_limited(data: bytes, limit: int) -> bytes:
+    """Decode every gzip member, rejecting incomplete or oversized bodies."""
+    import gzip
     import zlib
-    d = zlib.decompressobj(31)
-    out = d.decompress(data, limit)
-    if d.unconsumed_tail:
+    from io import BytesIO
+
+    if limit < 0:
+        raise ValueError("decompressed body limit must be nonnegative")
+    try:
+        with gzip.GzipFile(fileobj=BytesIO(data)) as stream:
+            # One extra byte detects overflow and forces the trailer check
+            # even when the decoded body fits the limit exactly. GzipFile
+            # also handles concatenated members under the same total cap.
+            out = stream.read(limit + 1)
+    except (EOFError, OSError, zlib.error) as exc:
+        raise ValueError(f"invalid gzip body: {exc}") from exc
+    if len(out) > limit:
         raise ValueError(f"decompressed body exceeds cap of {limit} bytes")
     return out
 
 
-def fetch_json(url, headers=None, timeout=10, limit=MAX_JSON_BYTES):
+def _inflate(headers, body: bytes, limit: int) -> bytes:
+    """The body as the server meant it: inflated when Content-Encoding
+    says gzip and the bytes agree.  A server that declares gzip and
+    sends plain text (a misconfigured error page, typically) gets the
+    benefit of the doubt rather than a zlib error."""
+    encoding = (headers.get("Content-Encoding") or "").strip().lower()
+    if encoding in ("gzip", "x-gzip") and body[:2] == b"\x1f\x8b":
+        return gunzip_limited(body, limit)
+    return body
+
+
+class HTTPError(OSError):
+    """A response that was not 2xx.  Mirrors the attributes callers read
+    off urllib.error.HTTPError: code, reason, headers, url."""
+
+    url: str
+    code: int
+    reason: str
+    headers: "Message | None"
+    body: bytes
+
+    def __init__(self, url: str, code: int, reason: str,
+                 headers: "Message | None" = None, body: bytes = b"") -> None:
+        super().__init__(f"HTTP Error {code}: {reason}")
+        self.url = url
+        self.code = code
+        self.reason = reason
+        self.headers = headers
+        self.body = body
+
+
+def unanswered(exc: BaseException) -> bool:
+    """Whether a fetch failed for want of an answer rather than on the
+    one it got: a timeout, a connection refused or dropped, a name that
+    would not resolve.  An error status is the server answering, and so
+    is a body that will not parse."""
+    return isinstance(exc, OSError) and not isinstance(exc, HTTPError)
+
+
+def _proxied():
+    """True when the environment asks for a proxy (http_proxy and kin);
+    those requests take urllib's proxy-aware path instead of ours."""
+    for name, value in os.environ.items():
+        low = name.lower()
+        if value and low.endswith("_proxy") and low != "no_proxy":
+            return True
+    return False
+
+
+def _check_scheme(parts):
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme {scheme or '(none)'!r} "
+                         f"for host {parts.hostname or '(none)'!r}")
+    return scheme
+
+
+def _request_urllib(url, headers, timeout, limit):
+    """One GET through urllib, which honours the proxy environment.
+
+    Same contract as _request.  urllib's own redirect handling is
+    switched off, so a 3xx comes back here and fetch_bytes follows it
+    under the same credential policy as the direct path; left to itself,
+    urllib would carry every header to wherever the Location pointed.
+    """
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None  # the 3xx surfaces as an HTTPError below
+
+    _check_scheme(urllib.parse.urlsplit(url))
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            body = _inflate(resp.headers, read_limited(resp, limit), limit)
+            return resp.status, resp.reason, resp.headers, body
+    except urllib.error.HTTPError as exc:
+        with exc:
+            body = read_limited(exc, limit) if exc.fp is not None else b""
+        return exc.code, exc.reason, exc.headers, body
+
+
+def _origin(url):
+    """(scheme, host, port) with the scheme's default port filled in, so
+    https://h.example and https://h.example:443 are the same origin."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    return scheme, host, parts.port or _DEFAULT_PORTS.get(scheme)
+
+
+def _redirect_headers(origin, url, target, headers, status, reason,
+                      resp_headers):
+    """The headers to send to a redirect target.
+
+    Same origin keeps them all.  A different origin gets them without
+    the credentials, and since the caller carries the result forward,
+    a later hop back to the first origin does not get them back either.
+    A request still carrying a credential that is sent from HTTPS to
+    HTTP raises instead: the server asked for the key in the clear.
+    """
+    sensitive = [k for k in headers if k.lower() in _SENSITIVE_HEADERS]
+    if not sensitive or _origin(target) == origin:
+        return headers
+    if (urllib.parse.urlsplit(url).scheme.lower() == "https"
+            and urllib.parse.urlsplit(target).scheme.lower() == "http"):
+        raise HTTPError(url, status,
+                        f"{reason}: refusing to follow an authenticated "
+                        f"redirect from HTTPS to HTTP", resp_headers)
+    if debug_enabled():
+        debug_log(f"redirect leaves the origin; dropping {', '.join(sensitive)}")
+    return {k: v for k, v in headers.items()
+            if k.lower() not in _SENSITIVE_HEADERS}
+
+
+def _connection(key, timeout):
+    """The calling thread's connection for (scheme, host, port), opened
+    lazily by http.client on the first request; the timeout is refreshed
+    on the socket so each request honours its own."""
+    import http.client
+    conns = getattr(_local, "conns", None)
+    if conns is None:
+        conns = _local.conns = {}
+    conn = conns.get(key)
+    if conn is None:
+        scheme, host, port = key
+        cls = (http.client.HTTPSConnection if scheme == "https"
+               else http.client.HTTPConnection)
+        conn = conns[key] = cls(host, port, timeout=timeout)
+    else:
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+    return conn
+
+
+def _drop(key):
+    conns = getattr(_local, "conns", None)
+    conn = conns.pop(key, None) if conns else None
+    if conn is not None:
+        conn.close()
+
+
+def _stale_connection_errors():
+    import http.client
+    import ssl
+    return (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+            http.client.ResponseNotReady, ConnectionResetError,
+            ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError)
+
+
+def _request(url, headers, timeout, limit):
+    """One GET on the thread's connection for url's host.
+
+    Returns (status, reason, headers, body).  A reused connection the
+    server has already closed fails with a disconnect on the first byte;
+    that is dropped and the request retried once on a fresh socket.  A
+    brand-new connection that fails is not retried.
+    """
+    parts = urllib.parse.urlsplit(url)
+    scheme = _check_scheme(parts)
+    key = (scheme, parts.hostname, parts.port)
+    selector = parts.path or "/"
+    if parts.query:
+        selector += "?" + parts.query
+    for attempt in (0, 1):
+        conn = _connection(key, timeout)
+        reused = conn.sock is not None
+        try:
+            conn.request("GET", selector, headers=headers)
+            resp = conn.getresponse()
+            body = _inflate(resp.headers, read_limited(resp, limit), limit)
+        except _stale_connection_errors() as exc:
+            _drop(key)
+            if reused and attempt == 0:
+                debug_log(f"reconnecting to {parts.hostname}: {exc}")
+                continue
+            raise
+        except BaseException:
+            _drop(key)  # state unknown after an interrupted exchange
+            raise
+        return resp.status, resp.reason, resp.headers, body
+
+
+def fetch_bytes(url: str, headers: dict[str, str] | None = None,
+                timeout: float = 10, limit: int = MAX_BODY_BYTES) -> bytes:
+    """GET url and return the body bytes, refusing more than limit of them.
+
+    Raises HTTPError for a non-2xx status, OSError (timeouts, refused
+    connections, TLS failures) on transport trouble, and ValueError for
+    invalid gzip or a body past the limit, compressed or inflated. file:// URLs read
+    the local file, as they did under urllib.  Redirects are followed,
+    with credentials kept to the starting origin (see _redirect_headers).
+    """
+    if debug_enabled():
+        debug_log(f"fetch {redact_url(url)}")
+    from linecast import user_agent
+    hdrs = {"User-Agent": user_agent(), "Connection": "keep-alive",
+            "Accept-Encoding": "gzip"}
+    if headers:
+        hdrs.update(headers)
+    if url.startswith("file:"):
+        # url2pathname unquotes and turns /C:/x into C:\x on Windows.
+        from urllib.request import url2pathname
+        path = url2pathname(urllib.parse.urlsplit(url).path)
+        with open(path, "rb") as fh:
+            return fh.read()
+    request = _request_urllib if _proxied() else _request
+    origin = _origin(url)
+    for _ in range(_MAX_REDIRECTS + 1):
+        status, reason, resp_headers, body = request(url, hdrs, timeout, limit)
+        if 200 <= status < 300:
+            return body
+        target = resp_headers.get("Location") if status in _REDIRECTS else None
+        if not target:
+            raise HTTPError(url, status, reason, resp_headers, body)
+        target = urllib.parse.urljoin(url, target)
+        hdrs = _redirect_headers(origin, url, target, hdrs, status, reason,
+                                 resp_headers)
+        url = target
+        if debug_enabled():
+            debug_log(f"redirect -> {redact_url(url)}")
+    raise HTTPError(url, status, "too many redirects", resp_headers, body)
+
+
+def fetch_json(url: str, headers: dict[str, str] | None = None,
+               timeout: float = 10, limit: int = MAX_JSON_BYTES) -> Any:
     """Fetch and decode a JSON payload from url."""
-    debug_log(f"fetch {url}")
-    req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(read_limited(resp, limit))
+    return json.loads(fetch_bytes(url, headers=headers, timeout=timeout,
+                                  limit=limit))
 
 
-def fetch_json_cached(cache_file, max_age, url, headers=None, timeout=10, fallback=None):
-    """Fetch JSON with fresh cache first, stale cache fallback, then fallback value."""
+def fetch_json_cached(cache_file: Path, max_age: float, url: str,
+                      headers: dict[str, str] | None = None, timeout: float = 10,
+                      fallback: Any = None,
+                      fetch: "Callable[..., Any] | None" = None,
+                      fresh: "Callable[[Any], bool] | None" = None,
+                      transform: "Callable[[Any], Any] | None" = None,
+                      provider: str = "http") -> Any:
+    """Fetch JSON with fresh cache first, stale cache fallback, then fallback value.
+
+    `fetch` replaces fetch_json for the network step (called as
+    fetch(url, timeout=...)), for a provider that counts or signs its
+    own requests; only a cache miss reaches it.
+
+    `fresh` is a second test a cached copy must pass, on its content
+    rather than its age -- a forecast whose "today" has gone by is stale
+    however young the file.  A copy that fails it is refetched, and
+    still stands in when the refetch fails.
+
+    `transform` turns the provider's answer into what the caller keeps,
+    and only what it returns is written.  The file, stale or fresh, then
+    always holds the caller's own rows and never the provider's payload,
+    so nothing that reads it has to tell the two apart.  A transform
+    that raises is a failed fetch like any other: the stale copy stands
+    in, or the fallback.
+
+    `provider` names the caller in the --debug line a failure writes.
+    """
     cached = read_cache(cache_file, max_age)
-    if cached is not None:
+    if cached is not None and (fresh is None or fresh(cached)):
         debug_log(f"cache hit: {cache_file.name}")
         return cached
 
     try:
-        data = fetch_json(url, headers=headers, timeout=timeout)
+        if fetch is not None:
+            data = fetch(url, timeout=timeout)
+        else:
+            data = fetch_json(url, headers=headers, timeout=timeout)
     except Exception as exc:
-        debug_log(f"fetch failed: {url} \u2014 {exc}")
-        stale = read_stale(cache_file)
-        if stale is not None:
-            debug_log(f"using stale cache: {cache_file.name}")
-            return stale
-        return fallback
+        return _stand_in(cache_file, fallback, provider, "fetch", exc, url)
+    if transform is not None:
+        try:
+            data = transform(data)
+        except Exception as exc:
+            return _stand_in(cache_file, fallback, provider, "parse", exc, url)
 
     write_cache(cache_file, data)
+    return data
+
+
+def _stand_in(cache_file, fallback, provider, operation, exc, url):
+    """The stale copy of a cached fetch that failed, else the fallback."""
+    stale = read_stale(cache_file)
+    log_failure(provider, operation, exc, url=url,
+                fallback=(f"stale cache {cache_file.name}"
+                          if stale is not None else "fallback value"))
+    return stale if stale is not None else fallback
+
+
+def fetch_bytes_cached(cache_file: Path, max_age: float | None, url: str,
+                       headers: dict[str, str] | None = None,
+                       timeout: float = 10, provider: str = "http") -> bytes | None:
+    """Fetch bytes with fresh cache first, stale cache fallback, else None.
+
+    max_age None means the cached copy never expires (immutable tiles).
+    `provider` names the caller in the --debug line a failure writes.
+    """
+    try:
+        if cache_file.exists() and (
+                max_age is None
+                or is_fresh(cache_file.stat().st_mtime, max_age)):
+            return cache_file.read_bytes()
+    except OSError as exc:
+        log_failure("cache", f"read of {cache_file.name}", exc,
+                    fallback="refetching")
+
+    try:
+        data = fetch_bytes(url, headers=headers, timeout=timeout)
+    except Exception as exc:
+        stale = None
+        try:
+            if cache_file.exists():
+                stale = cache_file.read_bytes()
+        except OSError as stale_exc:
+            log_failure("cache", f"stale read of {cache_file.name}", stale_exc,
+                        fallback="no data")
+        log_failure(provider, "fetch", exc, url=url,
+                    fallback=(f"stale cache {cache_file.name}"
+                              if stale is not None else "none"))
+        return stale
+
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        write_bytes_atomic(cache_file, data)
+    except OSError as exc:
+        log_failure("cache", f"write of {cache_file.name}", exc,
+                    fallback="not cached")
     return data
