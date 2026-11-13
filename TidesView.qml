@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -19,10 +20,10 @@ Item {
 
   readonly property int panelWidth: Style.space(380)
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color muted: Qt.darker(foreground, 1.4)
-  readonly property color waterColor: Color.accent
+  readonly property color waterColor: Commons.Color.accent
 
   readonly property var payload: feed.payload
   readonly property var events: payload && payload.events ? payload.events : []
@@ -363,8 +364,8 @@ Item {
         }
         width: hoverColumn.implicitWidth + Style.space(16)
         height: hoverColumn.implicitHeight + Style.space(12)
-        color: Color.tooltip.background
-        border.color: Color.tooltip.border
+        color: Commons.Color.tooltip.background
+        border.color: Commons.Color.tooltip.border
         border.width: 1
 
         Column {
@@ -381,7 +382,7 @@ Item {
               tag = Model.dayTag(local, view.nowMs)
               return Model.clockLabelMs(view.hoverMs) + (tag !== "" ? " " + tag : "")
             }
-            color: Color.tooltip.text
+            color: Commons.Color.tooltip.text
             font.family: view.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
@@ -389,7 +390,7 @@ Item {
           Text {
             textFormat: Text.PlainText
             text: view.fmtHeight(view.hoverHeight)
-            color: Color.tooltip.text
+            color: Commons.Color.tooltip.text
             font.family: view.fontFamily
             font.pixelSize: Style.font.bodySmall
             font.bold: true
@@ -398,7 +399,7 @@ Item {
           Text {
             textFormat: Text.PlainText
             text: view.hovering ? (view.hoverRising ? "rising" : "falling") : ""
-            color: Qt.darker(Color.tooltip.text, 1.3)
+            color: Qt.darker(Commons.Color.tooltip.text, 1.3)
             font.family: view.fontFamily
             font.pixelSize: Style.font.bodySmall
           }

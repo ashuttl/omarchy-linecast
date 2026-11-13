@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -29,10 +30,10 @@ Item {
   readonly property int panelWidth: Style.space(400)
   readonly property bool editingText: searchField.activeFocus
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color muted: Qt.darker(foreground, 1.4)
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
 
   readonly property var payload: feed.payload
   readonly property var current: payload ? payload.current : null
@@ -376,7 +377,7 @@ Item {
               id: badgeText
               anchors.centerIn: parent
               text: "󰀦 " + (alertItem.modelData.event || alertItem.modelData.headline || "Alert")
-              color: Color.background
+              color: Commons.Color.background
               font.family: view.fontFamily
               font.pixelSize: Style.font.bodySmall
               font.bold: true
@@ -431,7 +432,7 @@ Item {
           text: String(alertItem.modelData.url || "")
           elide: Text.ElideMiddle
           width: parent.width
-          color: Color.accent
+          color: Commons.Color.accent
           font.family: view.fontFamily
           font.pixelSize: Style.font.bodySmall
 
@@ -670,8 +671,8 @@ Item {
           }
           width: chipColumn.implicitWidth + Style.space(16)
           height: chipColumn.implicitHeight + Style.space(12)
-          color: Color.tooltip.background
-          border.color: Color.tooltip.border
+          color: Commons.Color.tooltip.background
+          border.color: Commons.Color.tooltip.border
           border.width: 1
 
           Column {
@@ -682,7 +683,7 @@ Item {
             Text {
               textFormat: Text.PlainText
               text: hourlyChart.hoverHour ? Model.clockLabel(hourlyChart.hoverHour.time) : ""
-              color: Color.tooltip.text
+              color: Commons.Color.tooltip.text
               font.family: view.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
@@ -695,7 +696,7 @@ Item {
                 text: hourlyChart.hoverHour ? Model.roundTemp(hourlyChart.hoverHour.temperature) : ""
                 color: hourlyChart.hoverHour
                   ? Model.tempColor(hourlyChart.hoverHour.temperature, view.tempUnit, view.tempStops)
-                  : Color.tooltip.text
+                  : Commons.Color.tooltip.text
                 font.family: view.fontFamily
                 font.pixelSize: Style.font.bodySmall
                 font.bold: true
@@ -705,7 +706,7 @@ Item {
                 textFormat: Text.PlainText
                 visible: hourlyChart.hoverHour && Model.num(hourlyChart.hoverHour.feels_like, NaN) === Model.num(hourlyChart.hoverHour.feels_like, NaN)
                 text: hourlyChart.hoverHour ? "feels " + Model.roundTemp(hourlyChart.hoverHour.feels_like) : ""
-                color: Qt.darker(Color.tooltip.text, 1.3)
+                color: Qt.darker(Commons.Color.tooltip.text, 1.3)
                 font.family: view.fontFamily
                 font.pixelSize: Style.font.bodySmall
               }
@@ -714,7 +715,7 @@ Item {
             Text {
               textFormat: Text.PlainText
               text: hourlyChart.hoverHour ? (hourlyChart.hoverHour.condition || "") : ""
-              color: Color.tooltip.text
+              color: Commons.Color.tooltip.text
               font.family: view.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
@@ -725,7 +726,7 @@ Item {
               text: hourlyChart.hoverHour ? Math.round(Model.num(hourlyChart.hoverHour.precipitation_probability, 0)) + "% precip" : ""
               color: {
                 var pc = Model.precipColorFor(hourlyChart.hoverHour ? hourlyChart.hoverHour.weather_code : 0,
-                                              Color.tooltip.text, view.themeColors)
+                                              Commons.Color.tooltip.text, view.themeColors)
                 return Qt.rgba(pc.r, pc.g, pc.b, 1)
               }
               font.family: view.fontFamily
@@ -974,7 +975,7 @@ Item {
           id: settingsLabel
           anchors.verticalCenter: parent.verticalCenter
           text: (view.settingsOpen ? "▾" : "▸") + "  PILLS, UNITS, AND CLOCK"
-          color: settingsMouse.containsMouse ? Style.hoverStateColor(view.muted, Color.accent) : view.muted
+          color: settingsMouse.containsMouse ? Style.hoverStateColor(view.muted, Commons.Color.accent) : view.muted
           font.family: view.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true

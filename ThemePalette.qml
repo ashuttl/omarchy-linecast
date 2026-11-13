@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 // The current theme's ANSI palette, read from colors.toml and cooked into
@@ -13,10 +14,10 @@ QtObject {
   id: root
 
   property var colors: null
-  readonly property var tempStops: Model.buildTempStops(colors, Color.background)
+  readonly property var tempStops: Model.buildTempStops(colors, Commons.Color.background)
 
   property Connections colorWatch: Connections {
-    target: Color
+    target: Commons.Color
     function onForegroundChanged() { root.file.reload() }
     function onBackgroundChanged() { root.file.reload() }
     function onAccentChanged() { root.file.reload() }

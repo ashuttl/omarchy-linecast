@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -20,11 +21,11 @@ Item {
 
   readonly property int panelWidth: Style.space(340)
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color muted: Qt.darker(foreground, 1.4)
   readonly property var themeColors: palette ? palette.colors : null
-  readonly property var sky: Model.buildSkyStops(themeColors, Color.background)
+  readonly property var sky: Model.buildSkyStops(themeColors, Commons.Color.background)
 
   readonly property var payload: feed.payload
 
@@ -336,8 +337,8 @@ Item {
         }
         width: scrubColumn.implicitWidth + Style.space(16)
         height: scrubColumn.implicitHeight + Style.space(12)
-        color: Color.tooltip.background
-        border.color: Color.tooltip.border
+        color: Commons.Color.tooltip.background
+        border.color: Commons.Color.tooltip.border
         border.width: 1
 
         Column {
@@ -348,7 +349,7 @@ Item {
           Text {
             textFormat: Text.PlainText
             text: Model.clockLabelMs(view.focusMs)
-            color: Color.tooltip.text
+            color: Commons.Color.tooltip.text
             font.family: view.fontFamily
             font.pixelSize: Style.font.bodySmall
             font.bold: true
@@ -359,7 +360,7 @@ Item {
             text: isNaN(view.focusElev) ? ""
               : (view.focusElev >= 0 ? Math.round(view.focusElev) + "° above the horizon"
                                      : Math.round(-view.focusElev) + "° below the horizon")
-            color: Color.tooltip.text
+            color: Commons.Color.tooltip.text
             font.family: view.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
@@ -367,7 +368,7 @@ Item {
           Text {
             textFormat: Text.PlainText
             text: view.twilightWord(view.focusElev)
-            color: Qt.darker(Color.tooltip.text, 1.3)
+            color: Qt.darker(Commons.Color.tooltip.text, 1.3)
             font.family: view.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
