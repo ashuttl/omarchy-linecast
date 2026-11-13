@@ -376,10 +376,11 @@ Item {
           Text {
             textFormat: Text.PlainText
             text: {
-              var tag = Model.dayTag(new Date(view.hoverMs).toISOString(), view.nowMs)
+              // Evaluated while the chip is hidden too, when hoverMs is NaN.
+              if (!view.hovering) return ""
               var d = new Date(view.hoverMs)
               var local = d.getFullYear() + "-" + (d.getMonth() < 9 ? "0" : "") + (d.getMonth() + 1) + "-" + (d.getDate() < 10 ? "0" : "") + d.getDate() + "T00:00"
-              tag = Model.dayTag(local, view.nowMs)
+              var tag = Model.dayTag(local, view.nowMs)
               return Model.clockLabelMs(view.hoverMs) + (tag !== "" ? " " + tag : "")
             }
             color: Commons.Color.tooltip.text
