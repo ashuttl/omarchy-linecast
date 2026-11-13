@@ -1,4 +1,6 @@
 import QtQuick
+import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -156,18 +158,32 @@ BarWidget {
     p.open()
   }
 
-  // Every Linecast widget on the bar, whichever plugin shipped it, so a
-  // request can cross from one companion to another. A bar surface is built
-  // per monitor, so each widget appears here once per screen.
-  function familySlots(sameModuleOnly) {
-    var slots = bar && bar.moduleSlots ? bar.moduleSlots : []
+  // Every Linecast widget the host will show us, so a request can cross from
+  // one companion to another. A bar surface is built per monitor, so each
+  // widget appears here once per screen.
+  //
+  // The Bar lists its slots; the PluginBarApi facade an installed plugin is
+  // handed on 4.0.3 does not, and its moduleWidgets() answers only for our
+  // own moduleName. On that path the family narrows to this plugin's own
+  // copies and a cross-plugin `openSection` falls back to the receiving
+  // widget, which is as far as the facade lets a plugin reach.
+  function familyItems(sameModuleOnly) {
+    var slots = bar && bar.moduleSlots ? bar.moduleSlots : null
     var found = []
-    for (var i = 0; i < slots.length; i++) {
-      var slot = slots[i]
-      if (!slot || !slot.activeItem || slot.activeItem.linecastWidget !== true) continue
-      if (sameModuleOnly && slot.moduleName !== root.moduleName) continue
-      found.push(slot)
+    if (slots) {
+      for (var i = 0; i < slots.length; i++) {
+        var slot = slots[i]
+        if (!slot || !slot.activeItem || slot.activeItem.linecastWidget !== true) continue
+        if (sameModuleOnly && slot.moduleName !== root.moduleName) continue
+        found.push(slot.activeItem)
+      }
+      return found
     }
+    var items = bar && typeof bar.moduleWidgets === "function"
+      ? bar.moduleWidgets(root.moduleName) : []
+    var count = items && typeof items.length === "number" ? items.length : 0
+    for (var j = 0; j < count; j++)
+      if (items[j] && items[j].linecastWidget === true) found.push(items[j])
     return found
   }
 
@@ -180,32 +196,32 @@ BarWidget {
   // id, and the pill we were handed is what identifies the widget here.
   function openSectionFromIpc(section) {
     var name = String(section || "")
-    var slots = familySlots(false)
+    var items = familyItems(false)
     var owners = []
-    for (var i = 0; i < slots.length; i++) {
-      var item = slots[i].activeItem
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i]
       if (typeof item.sectionEnabled !== "function" || !item.sectionEnabled(name)) continue
       item.setSection(name)
-      owners.push(slots[i])
+      owners.push(item)
     }
-    // No widget on the bar carries this pill (or we have no bar to ask):
+    // No widget we can see carries this pill (or we have no bar to ask):
     // fall back to our own anchor pill rather than doing nothing.
     if (owners.length === 0) {
       openSection(sectionEnabled(name) ? name : pillOrder[0])
       return
     }
-    var target = pickOwnerSlot(owners)
-    if (target && target.activeItem) target.activeItem.open()
+    var target = pickOwner(owners)
+    if (target) target.open()
   }
 
   // `refresh` is about the data behind the pills, which every Linecast widget
   // shares, so it reaches the whole family rather than stopping at this
   // plugin's own copies.
   function refreshFamily() {
-    var slots = familySlots(false)
+    var items = familyItems(false)
     var seen = []
-    for (var i = 0; i < slots.length; i++) {
-      var item = slots[i].activeItem
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i]
       if (seen.indexOf(item) !== -1 || typeof item.refresh !== "function") continue
       seen.push(item)
       item.refresh()
@@ -213,18 +229,34 @@ BarWidget {
     if (seen.indexOf(root) === -1) root.refresh()
   }
 
-  // The same narrowing Bar.findPanelWidget applies, restricted to the slots
+  // The screen a widget is drawn on. The Bar resolves this from the slot; the
+  // facade exposes neither the slot nor the lookup, so read the surface off
+  // the widget itself.
+  function screenNameOf(item) {
+    var window = item && item.QsWindow ? item.QsWindow.window : null
+    return window && window.screen ? String(window.screen.name || "") : ""
+  }
+
+  // Same answer Bar.focusedScreenName gives, asked of Hyprland directly when
+  // the host we were handed cannot be asked.
+  function focusedScreenName() {
+    if (bar && typeof bar.focusedScreenName === "function") return bar.focusedScreenName()
+    var monitor = Hyprland.focusedMonitor
+    return monitor ? String(monitor.name || "") : ""
+  }
+
+  // The same narrowing Bar.findPanelWidget applies, restricted to the widgets
   // that carry the pill we were asked for. An already-open copy wins, so
   // a repeat call reaches the panel the user can see; otherwise the focused
   // monitor's copy does. Anchored center modules leave a zero-size
-  // placeholder slot behind, so prefer one that is actually drawn.
-  function pickOwnerSlot(slots) {
-    var pool = slots.filter(function(slot) { return slot.activeItem.opened === true })
-    if (pool.length === 0) pool = slots
+  // placeholder behind, so prefer one that is actually drawn.
+  function pickOwner(items) {
+    var pool = items.filter(function(item) { return item.opened === true })
+    if (pool.length === 0) pool = items
 
-    var focused = bar && typeof bar.focusedScreenName === "function" ? bar.focusedScreenName() : ""
-    if (focused && typeof bar.slotScreenName === "function") {
-      var onFocused = pool.filter(function(slot) { return bar.slotScreenName(slot) === focused })
+    var focused = root.focusedScreenName()
+    if (focused) {
+      var onFocused = pool.filter(function(item) { return root.screenNameOf(item) === focused })
       if (onFocused.length > 0) pool = onFocused
     }
 
@@ -238,10 +270,10 @@ BarWidget {
   // target they arrived on and pick the copy the bar would route a hotkey to
   // — per monitor, rather than whichever one happens to hold the target.
   function ipcPanelWidget() {
-    var mine = familySlots(true)
+    var mine = familyItems(true)
     if (mine.length === 0) return root
-    var target = pickOwnerSlot(mine)
-    return target && target.activeItem ? target.activeItem : root
+    var target = pickOwner(mine)
+    return target ? target : root
   }
 
   function refresh() {
